@@ -1,0 +1,22 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "vainglory-server"
+path = "src/main.rs"
+
+[dependencies]
+bevy = { workspace = true }
+game-core = { path = "../game-core" }
+renet2 = { workspace = true }
+renet2_netcode = { workspace = true }
+serde = { workspace = true }
+bitcode = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+fixed = { workspace = true }

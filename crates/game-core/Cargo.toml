@@ -1,0 +1,12 @@
+[package]
+name = "game-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { workspace = true }
+glam = { workspace = true }
+serde = { workspace = true }
+bitcode = { workspace = true }
+thiserror = { workspace = true }
+fixed = "1.0"
