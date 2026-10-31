@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/game-core", "crates/client", "crates/server", "crates/matchmaking"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Vainglory Rust reimplementation"
+
+[workspace.dependencies]
+bevy = { version = "0.20.1", features = ["debug"] }
+bevy_egui = "0.43"
+renet2 = "0.12"
+renet2_netcode = "0.12"
+bevy_renet2 = "1.0"
+bitcode = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rand = "0.8"
+fixed = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+axum = "0.7"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
+glam = { version = "0.34",features = ["serde"] }
+
+[profile.dev]
+opt-level = 1
