@@ -8,17 +8,30 @@ use crate::networking::{ClientNetIds, DummyRegistry, NextNetId, RenetServerResou
 use bitcode;
 use renet2::DefaultChannel;
 
+/// 一次性生成标记：静态世界（炮塔 / 水晶 / 野怪 / 假人）只在第一次进入 Running 时生成，
+/// 之后即使状态在 Running↔WaitingForPlayers 间抖动也不重复生成，否则 NetId 会无限增长、
+/// 客户端实体爆炸（GPU OOM）。
+#[derive(Resource, Default)]
+struct SpawnFlags {
+    turrets: bool,
+    crystals: bool,
+    jungle: bool,
+    dummies: bool,
+    minions: bool,
+}
+
 pub struct SpawnPlugin;
 
 impl Plugin for SpawnPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(crate::ServerState::Running), (
-            spawn_turrets,
-            spawn_vain_crystals,
-            spawn_jungle_camps,
-            spawn_training_dummies,
-            spawn_initial_minions,
-        ));
+        app.init_resource::<SpawnFlags>()
+            .add_systems(OnEnter(crate::ServerState::Running), (
+                spawn_turrets,
+                spawn_vain_crystals,
+                spawn_jungle_camps,
+                spawn_training_dummies,
+                spawn_initial_minions,
+            ));
     }
 }
 
@@ -29,7 +42,12 @@ fn spawn_training_dummies(
     mut dummy_registry: ResMut<DummyRegistry>,
     mut server_res: Option<ResMut<RenetServerResource>>,
     client_net_ids: Res<ClientNetIds>,
+    mut flags: ResMut<SpawnFlags>,
 ) {
+    if flags.dummies {
+        return;
+    }
+    flags.dummies = true;
     let positions = [
         Vec3::new(-15.0, 0.0, -12.0), // 蓝方出生点前方
         Vec3::new(15.0, 0.0, 12.0),   // 红方出生点前方
@@ -88,7 +106,12 @@ fn spawn_turrets(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut flags: ResMut<SpawnFlags>,
 ) {
+    if flags.turrets {
+        return;
+    }
+    flags.turrets = true;
     for turret_pos in TURRET_POSITIONS {
         let (max_health, attack_damage, armor, magic_resist, attack_range, attack_speed) = match turret_pos.turret_type {
             TurretType::Outer => (3000.0, 150.0, 100.0, 100.0, 12.0, 0.8),
@@ -120,7 +143,12 @@ fn spawn_turrets(
 
 fn spawn_vain_crystals(
     mut commands: Commands,
+    mut flags: ResMut<SpawnFlags>,
 ) {
+    if flags.crystals {
+        return;
+    }
+    flags.crystals = true;
     for (pos, team) in [(BLUE_VAIN_CRYSTAL, Team::Blue), (RED_VAIN_CRYSTAL, Team::Red)] {
         commands.spawn((
             Transform::from_translation(pos + Vec3::Y * 6.0),
@@ -145,7 +173,12 @@ fn spawn_vain_crystals(
 
 fn spawn_jungle_camps(
     mut commands: Commands,
+    mut flags: ResMut<SpawnFlags>,
 ) {
+    if flags.jungle {
+        return;
+    }
+    flags.jungle = true;
     for camp in JUNGLE_CAMPS {
         let (max_health, attack_damage, armor, magic_resist, move_speed, attack_range, gold_reward, exp_reward, aggro_range, leash_range) = match camp.monster_type {
             JungleMonsterType::MinionMine => (5000.0, 120.0, 50.0, 50.0, 0.0, 2.0, 300, 500, 0.0, 0.0), // 静止
@@ -184,6 +217,11 @@ fn spawn_jungle_camps(
 
 fn spawn_initial_minions(
     mut commands: Commands,
+    mut flags: ResMut<SpawnFlags>,
 ) {
+    if flags.minions {
+        return;
+    }
+    flags.minions = true;
     // TODO: 生成第一波小兵
 }

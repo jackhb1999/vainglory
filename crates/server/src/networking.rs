@@ -174,8 +174,12 @@ fn poll_connections(
     server_res.0.update(delta);
     let _ = transport_res.0.update(delta, &mut server_res.0);
 
+    // 当前仍连接在 renet 中的客户端集合：用于新连接检测与过期清理
+    let live = server_res.0.clients_id();
+
     // 处理新连接
-    for client_id in server_res.0.clients_id() {
+    for client_id in &live {
+        let client_id = *client_id;
         if client_net_ids.0.contains_key(&client_id) {
             continue;
         }
@@ -282,6 +286,36 @@ fn poll_connections(
                 );
             }
             info!("Client {:?} (net {:?}) disconnected", client_id, net_id);
+        }
+    }
+
+    // 清理 stale 客户端：若某 client_id 仍在我们的映射里、却已不在 renet 连接集合中，
+    // 说明 renet 已丢弃该连接而 disconnections_id() 未上报（常见于超时 / 快速重连），
+    // 必须手动移除——否则后续 send_message 会持续刷 “invalid client” 错误，且英雄实体残留。
+    let live_set: std::collections::HashSet<ClientId> = live.iter().copied().collect();
+    let stale: Vec<ClientId> = client_net_ids
+        .0
+        .keys()
+        .copied()
+        .filter(|id| !live_set.contains(id))
+        .collect();
+    for client_id in stale {
+        if let Some((net_id, _)) = client_net_ids.0.remove(&client_id) {
+            for (entity, e_net_id, _) in heroes.iter() {
+                if *e_net_id == net_id {
+                    commands.entity(entity).despawn();
+                    break;
+                }
+            }
+            // 通知其余仍在连接的客户端移除该英雄实体
+            for other in client_net_ids.0.keys() {
+                let _ = server_res.0.send_message(
+                    *other,
+                    DefaultChannel::ReliableOrdered,
+                    bitcode::encode(&ServerMessage::Event(GameEvent::HeroDespawn { net_id })),
+                );
+            }
+            info!("Cleaned up stale client {:?} (net {:?})", client_id, net_id);
         }
     }
 

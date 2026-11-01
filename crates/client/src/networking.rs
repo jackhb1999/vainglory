@@ -11,7 +11,7 @@ use renet2::{ClientId, ConnectionConfig, DefaultChannel, RenetClient};
 use renet2_netcode::{ClientAuthentication, NativeSocket, NetcodeClientTransport};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use game_core::net::{
     ClientMessage, GameEvent, InputCmd, MatchState, PROTOCOL_VERSION, ServerMessage, WorldSnapshot,
 };
@@ -75,15 +75,14 @@ pub struct LocalHeroEntity(pub Option<Entity>);
 #[derive(Resource, Default)]
 pub struct ReconnectTimer(pub f32);
 
-/// 跨重连稳定的客户端身份：每次重连复用同一 client_id，
-/// 避免每次都生成全新身份导致服务端反复分配新英雄。
-#[derive(Resource)]
-pub struct ClientIdentity(pub u64);
-
-impl Default for ClientIdentity {
-    fn default() -> Self {
-        ClientIdentity(rand::random())
-    }
+/// 用真实墙钟驱动客户端 netcode 时钟，与服务端的 `NetcodeClock` 保持一致。
+///
+/// 不能用 Bevy 的 `Time::delta()`：窗口化运行时首次帧/卡顿帧 `delta()` 可能被
+/// 拉长，导致 netcode 时钟相对服务端飞奔或滞后，使服务端/客户端把彼此的数据包
+/// 判定为超时（connection timed out）。因此这里用 `Instant` 计算真实流逝时间。
+#[derive(Resource, Default)]
+pub struct ClientNetcodeClock {
+    last: Option<Instant>,
 }
 
 /// 断线后多久尝试一次重连（秒）。
@@ -99,7 +98,7 @@ impl Plugin for NetworkingPlugin {
             .init_resource::<HeroRegistry>()
             .init_resource::<LocalHeroEntity>()
             .init_resource::<ReconnectTimer>()
-            .init_resource::<ClientIdentity>()
+            .init_resource::<ClientNetcodeClock>()
             .add_systems(Startup, connect_to_server)
             .add_systems(
                 Update,
@@ -110,14 +109,14 @@ impl Plugin for NetworkingPlugin {
 
 /// 连接服务器（端口与 server 保持一致：5000）
 ///
-/// 使用跨重连稳定的 client_id，避免每次重连都生成全新身份（进而在服务端生成全新
-/// 英雄实体并把客户端刷爆）。重连前清理上一次本地英雄实体，避免残留多个“我控制的英雄”。
+/// 每次连接都用全新的随机 client_id。重连前清理上一次本地英雄实体，
+/// 避免残留多个“我控制的英雄”。不使用固定 client_id，以免 renet 在
+/// 重连复用同一 id 时把连接判为失效（connection timed out）。
 pub fn connect_to_server(
     mut commands: Commands,
     mut net_state: ResMut<NetworkState>,
     mut local_hero: ResMut<LocalHeroEntity>,
     mut hero_registry: ResMut<HeroRegistry>,
-    client_identity: Res<ClientIdentity>,
 ) {
     // 清理上一次本地英雄实体，避免重连换 net id 后残留多个“我控制的英雄”
     if let Some(e) = local_hero.0.take() {
@@ -135,7 +134,7 @@ pub fn connect_to_server(
     let authentication = ClientAuthentication::Unsecure {
         socket_id: 0,
         server_addr,
-        client_id: client_identity.0,
+        client_id: rand::random(),
         user_data: None,
         protocol_id: PROTOCOL_VERSION as u64,
     };
@@ -161,12 +160,11 @@ fn try_reconnect(
     time: Res<Time>,
     mut local_hero: ResMut<LocalHeroEntity>,
     mut hero_registry: ResMut<HeroRegistry>,
-    client_identity: Res<ClientIdentity>,
 ) {
     timer.0 -= time.delta_secs();
     if *net_state == NetworkState::Disconnected && timer.0 <= 0.0 {
         timer.0 = RECONNECT_INTERVAL;
-        connect_to_server(commands, net_state, local_hero, hero_registry, client_identity);
+        connect_to_server(commands, net_state, local_hero, hero_registry);
     }
 }
 
@@ -174,14 +172,19 @@ fn poll_connection(
     client_res: Option<ResMut<RenetClientResource>>,
     transport_res: Option<ResMut<ClientTransportResource>>,
     mut net_state: ResMut<NetworkState>,
-    time: Res<Time>,
+    mut clock: ResMut<ClientNetcodeClock>,
     mut timer: ResMut<ReconnectTimer>,
 ) {
     let (Some(mut client_res), Some(mut transport_res)) = (client_res, transport_res) else {
         return;
     };
 
-    let delta: Duration = time.delta();
+    let now = Instant::now();
+    let delta = match clock.last {
+        Some(last) => now.duration_since(last),
+        None => Duration::ZERO,
+    };
+    clock.last = Some(now);
     client_res.0.update(delta);
     if let Err(e) = transport_res.0.update(delta, &mut client_res.0) {
         warn!("Transport update error: {:?}", e);

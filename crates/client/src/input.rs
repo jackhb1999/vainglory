@@ -135,7 +135,7 @@ fn handle_input(
     mut move_target: ResMut<MoveTarget>,
     mut selected: ResMut<SelectedTarget>,
     heroes: Query<(Entity, &Transform, &NetId, &Selectable)>,
-    egui_ctx: Option<Res<EguiContexts>>,
+    egui_ctx: Option<NonSendMut<EguiContexts>>,
 ) {
     let player_pos = local_player_transform.0.translation;
 
@@ -162,7 +162,7 @@ fn handle_input(
 
     // --- 2. 左键点击地面：设置移动目标（点 UI 时不触发）---
     let over_ui = egui_ctx
-        .map_or(false, |ctx| ctx.ctx_mut().map_or(false, |c| c.is_pointer_over_egui()));
+        .map_or(false, |mut ctx| ctx.ctx_mut().map_or(false, |c| c.is_pointer_over_egui()));
     if !over_ui && mouse_buttons.just_pressed(MouseButton::Left) {
         if let (Ok(window), Ok(camera), Ok(cam_xform)) =
             (windows.single(), camera.single(), camera_xform.single())
@@ -390,7 +390,8 @@ mod tests {
         world.insert_resource(ButtonInput::<MouseButton>::default());
         world.insert_resource(Touches::default());
 
-        world.run_system(handle_input).expect("handle_input 应可运行");
+        let id = world.register_system(handle_input);
+        world.run_system(id).expect("handle_input 应可运行");
 
         let state = world.resource::<PlayerInputState>();
         assert_eq!(state.move_dir, Vec2::new(0.0, -1.0), "W 应映射为世界 -z 移动");
