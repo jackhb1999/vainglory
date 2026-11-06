@@ -53,8 +53,12 @@ pub fn facing_system(
 ) {
     for (mut transform, input) in query.iter_mut() {
         if input.aim_dir != Vec2::ZERO {
-            let angle = input.aim_dir.y.atan2(input.aim_dir.x);
-            transform.rotation = Quat::from_rotation_y(-angle);
+            // aim_dir 是地面世界坐标点：朝向 = 该点 - 自身位置
+            let dir = input.aim_dir - Vec2::new(transform.translation.x, transform.translation.z);
+            if dir.length_squared() > 1e-6 {
+                let angle = dir.y.atan2(dir.x);
+                transform.rotation = Quat::from_rotation_y(-angle);
+            }
         }
     }
 }
@@ -64,35 +68,56 @@ pub fn attack_system(
     time: Res<Time>,
     mut commands: Commands,
     mut query: Query<(Entity, &mut Hero, &Transform, &PlayerInput), With<LocalPlayer>>,
-    targets: Query<(Entity, &Transform, &Hero), (Without<LocalPlayer>, With<Selectable>)>,
+    targets: Query<(Entity, &Transform, &Hero, &NetId), (Without<LocalPlayer>, With<Selectable>)>,
 ) {
     let current_tick = (time.elapsed_secs() * TICK_RATE as f32) as u64;
-    
+    // NetId -> Entity 映射，用于按锁定目标攻击
+    let netid_to_entity: std::collections::HashMap<NetId, Entity> =
+        targets.iter().map(|(e, _, _, n)| (*n, e)).collect();
+
     for (entity, mut hero, transform, input) in query.iter_mut() {
-        if input.ability_mask & 0b0001 != 0 { // 基础攻击
-            let attack_range = hero.attack_range;
-            
-            // 寻找攻击范围内最近的敌人
-            let mut closest_target = None;
-            let mut closest_dist = f32::MAX;
-            
-            for (target_entity, target_transform, _) in targets.iter() {
-                let dist = transform.translation.distance(target_transform.translation);
-                if dist <= attack_range && dist < closest_dist {
-                    closest_dist = dist;
-                    closest_target = Some(target_entity);
+        // 冷却递减
+        if hero.attack_cooldown > 0.0 {
+            hero.attack_cooldown = (hero.attack_cooldown - FIXED_TIMESTEP).max(0.0);
+        }
+        if input.ability_mask & 0b0001 == 0 || hero.attack_cooldown > 0.0 {
+            continue;
+        }
+
+        let attack_range = hero.attack_range;
+        let mut target_entity: Option<Entity> = None;
+
+        // 优先攻击锁定的目标（右键指定的敌人）
+        if let Some(tid) = input.target_net_id {
+            if let Some(&te) = netid_to_entity.get(&tid) {
+                if let Ok((_, tt, _, _)) = targets.get(te) {
+                    if transform.translation.distance(tt.translation) <= attack_range {
+                        target_entity = Some(te);
+                    }
                 }
             }
-            
-            if let Some(target) = closest_target {
-                commands.entity(entity).insert(AttackCommand {
-                    target,
-                    attacker: entity,
-                    damage: hero.attack_damage,
-                    damage_type: DamageType::Physical,
-                    tick: current_tick,
-                });
+        }
+        // 否则攻击射程内最近的敌人（自动普攻）
+        if target_entity.is_none() {
+            let mut closest_dist = f32::MAX;
+            for (te, tt, _, _) in targets.iter() {
+                let d = transform.translation.distance(tt.translation);
+                if d <= attack_range && d < closest_dist {
+                    closest_dist = d;
+                    target_entity = Some(te);
+                }
             }
+        }
+
+        if let Some(t) = target_entity {
+            commands.entity(entity).insert(AttackCommand {
+                target: t,
+                attacker: entity,
+                damage: hero.attack_damage,
+                damage_type: DamageType::Physical,
+                tick: current_tick,
+            });
+            hero.attack_cooldown = 1.0 / hero.attack_speed.max(0.1);
         }
     }
 }
@@ -111,16 +136,24 @@ pub struct AttackCommand {
 pub fn damage_system(
     mut commands: Commands,
     mut attackers: Query<(Entity, &AttackCommand)>,
-    mut targets: Query<(&mut Hero, Option<&TrainingDummy>)>,
+    mut targets: Query<(&mut Hero, Option<&TrainingDummy>, &NetId)>,
+    mut damage_sink: Option<ResMut<DamageSink>>,
 ) {
     for (attacker, cmd) in attackers.iter_mut() {
-        if let Ok((mut target_hero, dummy)) = targets.get_mut(cmd.target) {
+        if let Ok((mut target_hero, dummy, target_net_id)) = targets.get_mut(cmd.target) {
             // 含护甲/魔抗减免的伤害结算
-            apply_mitigated_damage(&mut target_hero, cmd.damage, cmd.damage_type);
+            let dealt = apply_mitigated_damage(&mut target_hero, cmd.damage, cmd.damage_type);
+            info!(
+                "[DMG] target net={:?} dealt={:.1} health_now={:.1}/{:.1}",
+                target_net_id, dealt, target_hero.health, target_hero.max_health
+            );
+            if let Some(sink) = damage_sink.as_deref_mut() {
+                sink.0.push((cmd.attacker, cmd.target, dealt, cmd.damage_type));
+            }
 
             if target_hero.health <= 0.0 && dummy.is_none() {
                 // 击杀奖励
-                if let Ok((mut attacker_hero, _)) = targets.get_mut(cmd.attacker) {
+                if let Ok((mut attacker_hero, _, _)) = targets.get_mut(cmd.attacker) {
                     attacker_hero.gold += 50;
                     attacker_hero.experience += 100;
                 }
@@ -312,13 +345,16 @@ pub fn turret_ai_system(
     }
 }
 
-/// 血量回复系统
+/// 血量回复系统（训练假人不回血，方便测试攻击是否生效）
 pub fn health_regen_system(
     time: Res<Time>,
-    mut query: Query<&mut Hero>,
+    mut query: Query<(&mut Hero, Option<&TrainingDummy>)>,
 ) {
     let dt = time.delta_secs();
-    for mut hero in query.iter_mut() {
+    for (mut hero, dummy) in query.iter_mut() {
+        if dummy.is_some() {
+            continue;
+        }
         if hero.health > 0.0 && hero.health < hero.max_health {
             hero.health = (hero.health + hero.max_health * 0.01 * dt).min(hero.max_health);
         }

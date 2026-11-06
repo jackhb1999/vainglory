@@ -49,6 +49,7 @@ fn main() {
                 move_dir: game_core::net::Vec2f::new(1.0, 0.0),
                 aim_dir: game_core::net::Vec2f::zero(),
                 ability_mask: 0,
+                target_net_id: None,
                 ping: 0,
             }));
             client.send_message(DefaultChannel::Unreliable, bytes);

@@ -13,6 +13,7 @@ impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ServerTick>()
             .init_resource::<crate::networking::ServerEvents>()
+            .init_resource::<DamageSink>()
             .add_systems(FixedUpdate, (
                 tick_clock_system,
                 apply_pending_inputs,
@@ -22,6 +23,7 @@ impl Plugin for SimulationPlugin {
                 projectile_system,
                 damage_system,
                 resolve_pending_hits,
+                flush_damage_events,
                 ability_cooldown_system,
                 level_up_system,
                 passive_gold_system,
@@ -48,6 +50,7 @@ fn apply_pending_inputs(
             input.move_dir = Vec2::new(cmd.move_dir.x, cmd.move_dir.y);
             input.aim_dir = Vec2::new(cmd.aim_dir.x, cmd.aim_dir.y);
             input.ability_mask = cmd.ability_mask;
+            input.target_net_id = cmd.target_net_id.map(NetId);
             input.tick = cmd.tick;
         }
     }

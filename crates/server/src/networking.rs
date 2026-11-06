@@ -230,6 +230,7 @@ fn poll_connections(
                 ability_ids: game_core::abilities::default_hero_abilities(),
             },
             ServerAuthority,
+            LocalPlayer,
         )).id();
         info!("Spawned hero entity {:?} for net {:?}", hero_entity, net_id);
 
@@ -389,6 +390,16 @@ fn broadcast_snapshot(
             ability_cooldowns: abilities.cooldowns,
         })
         .collect();
+
+    // [临时诊断] 仅在英雄受到伤害（血量低于上限）时打印，确认服务端确实把扣血后的血量下发了
+    for es in &entities {
+        if es.health < es.max_health - 0.5 {
+            info!(
+                "[SNAP] net={:?} health={:.1}/{:.1}",
+                es.net_id, es.health, es.max_health
+            );
+        }
+    }
 
     // 弹道实体也随快照下发，供客户端渲染
     for (net_id, team, ts, proj) in projectiles.iter() {

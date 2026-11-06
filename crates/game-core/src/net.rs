@@ -135,6 +135,8 @@ pub struct InputCmd {
     pub move_dir: Vec2f,
     pub aim_dir: Vec2f,
     pub ability_mask: u8,
+    /// 锁定的普攻目标（NetId）。`None` 表示无锁定（普攻自动打射程内最近敌人）。
+    pub target_net_id: Option<u64>,
     pub ping: u32, // 客户端测量的 RTT
 }
 
@@ -298,6 +300,7 @@ mod tests {
             move_dir: Vec2f::new(1.0, 0.0),
             aim_dir: Vec2f::new(0.0, 1.0),
             ability_mask: 0b0001,
+            target_net_id: None,
             ping: 50,
         };
         

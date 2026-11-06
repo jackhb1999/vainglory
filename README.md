@@ -140,7 +140,93 @@
 
 ---
 
-## 四、如何启动与编译
+## 四、已知 Bug：敌人血量不下降（待解决）
+
+> 状态：**未解决**。攻击 / 技能命中敌人（训练假人）后，客户端看不到血条下降，`Hero.health` 数值不减少；但受击红闪（`HitFlash` / `DamageDealt`）会出现，说明命中事件已送达。
+
+### 已排查的链路
+- **服务端确实在扣血**：`damage_system`（`crates/game-core/src/systems.rs`）调用 `apply_mitigated_damage` 真正扣减 `Hero.health`；`broadcast_snapshot`（`crates/server/src/networking.rs`）在 `EntitySnapshot` 中带 `health` 字段下发。
+- **客户端插值已同步血量**：`interpolate_entities`（`crates/client/src/interpolation.rs`）从快照把 `health/max_health` 写回 `Interpolated` 实体（本地玩家是 `Predicted`，已被 `With<Interpolated>` 排除，故不受影响）。
+- **血条按血量缩放**：`update_health_bars`（`crates/client/src/rendering.rs`）按 `hero.health / hero.max_health` 缩放填充条。
+
+### 已尝试的修复（均未生效）
+1. 插值同步血量（`interpolation.rs`）。
+2. 服务端英雄加 `LocalPlayer`，使 `attack_system` 能触发普攻（此前普攻位 `bit0` 从未置位）。
+3. 右键锁定普攻 + 新增 `target_net_id` 协议字段（`InputCmd` / `PlayerInput` 均已加）；服务端 `attack_system` 优先攻击锁定目标并加普攻冷却。
+4. 训练假人加 `Selectable`、血量降到 600、关闭其回血（`health_regen_system` 跳过 `TrainingDummy`）。
+5. 假人从 3 个减为 1 个（地图中心 `(0,0,0)`），排除"总是打中第 2 个"的干扰。
+
+### 当前最可疑根因
+**用户一直运行的是改动前的旧二进制**：每次 `cargo build` 都报 `vainglory-server.exe 被占用`，说明有旧 server 进程在跑，导致全部修复未进入运行中的程序。
+
+### 临时诊断日志（已加入源码，仅在血量 < 上限时打印，定位后需删除）
+| 日志 | 出现端 | 位置 |
+|---|---|---|
+| `[DMG] target net=.. dealt=.. health_now=..` | 服务端 | `game-core/src/systems.rs` `damage_system` |
+| `[SNAP] net=.. health=..` | 服务端 | `server/src/networking.rs` `broadcast_snapshot` |
+| `[CLT-INT] net=.. health=..` / `[CLT-INT] NO HISTORY for net=..` | 客户端 | `client/src/interpolation.rs` `interpolate_entities` |
+| `[CLT-BAR] health=.. ratio=..` | 客户端 | `client/src/rendering.rs` `update_health_bars` |
+
+**判读**：四者都不出现 → 伤害没产生（技能/普攻未真正命中）；`[DMG]` 有、`[SNAP]` 无 → 快照没带扣血血量；`[SNAP]` 有、`[CLT-INT]` 无（或 `NO HISTORY`）→ 客户端没收到/没存该网元快照历史；`[CLT-INT]` 有、`[CLT-BAR]` 无 → 血条读取逻辑问题；四者都出现 → 数据链路已通，**之前是旧二进制问题，重跑新编译即可**。
+
+**下一步**：先彻底停掉旧 server/client 再 `cargo run -p server` / `cargo run -p client`，把出现的日志发回即可定位。
+
+---
+
+## 五、重构与设计目标（细化）
+
+> 以下为下一阶段大方向，优先满足"3D 地形 + 可见掉血 + 有手感的技能 + 像样的地图"。
+
+### 5.1 3D 地形地图（高度起伏）
+- **现状**：当前地图是 `y=0` 平面（`game-core/src/map.rs` 仅定义尺寸/位置常量），`ground_hit` 直接对 `y=0` 平面求交，所有实体 `y` 固定。
+- **目标**：基于 **heightmap（高度图）** 的 3D 地形，有丘陵、河谷、野区高地、兵线坡道等起伏。
+- **方案**：
+  - 新增 `Terrain` 资源：二维高度网格 `heights: Vec<f32>`（或噪声生成 `noise`/`fastnoise`），提供 `terrain_height(x, z) -> f32`（双线性插值）与 `terrain_normal(x, z)`。
+  - 用噪声/手绘高度图生成自然起伏；河道低洼、野区高地，形成战术高低差。
+  - 实体 `y` 由 `terrain_height(x, z)` 决定：英雄/小兵/野怪移动时贴合地面；弹道/技能以世界坐标 `(x, y, z)` 计算，AoE 判定考虑高度差（同区域高度相近则近似平面，远距离技能用 `y` 差做遮挡/命中判定）。
+  - `ground_hit` 改为对地形网格射线求交（或先用平面求交再把命中点抬到 `terrain_height`）。
+  - 移动/寻路/摄像机都要考虑坡度：限制可行走坡度（如 > 45° 不可走），路径点 `y` 跟随地形。
+  - 视觉：由 heightmap 生成细分 `Mesh`（顶点位移），叠加 albedo/法线贴图、草地/岩石/河道材质混合；配合方向光 + 阴影。
+
+### 5.2 英雄贴图 / 涂装（Skin & Texturing）
+- **现状**：`rendering.rs` 程序化生成圆柱体 + 队伍色圆盘贴图（`make_hero_texture`），无角色模型、无动画。
+- **目标**：每个英雄有独立外观——3D 角色模型 + 贴图 + 队伍配色 + 基础动画（idle / walk / attack / hit）。
+- **方案**：
+  - 资源管线：加载 glTF（`.glb`）角色模型（自绘或 CC0 资源），或继续程序化但增强为多部件 + 顶点色。
+  - 新增 `HeroVisual` / `HeroSkin` 组件：模型路径、队伍色 tint、贴图集。
+  - 贴图：albedo / normal / emissive，队伍色作为 overlay tint；可扩展皮肤（不同纹理/特效）。
+  - 动画：接入骨骼动画，按状态机切换 clip；受击/施法触发对应动作与特效。
+  - 朝向：保持现有"鼠标/瞄准方向决定 rotation"，模型正面朝瞄准方向。
+
+### 5.3 技能设计（Ability / Skill Design）
+- **现状**：`abilities.rs` 已有 `AbilityDef`（CD / 蓝耗 / 射程 / 类型 `Instant`/`Projectile`/`PointTarget` / 伤害类型 / 加成），4 槽位 Q/E/R/F，但只有占位数值，缺完整技能组与手感。
+- **目标**：设计一套**有辨识度的英雄技能组**（基础攻击 + 3 主动 + 1 终极），覆盖常见 archetype：
+  - **基础攻击**：远程/近战普攻（已接 `attack_system`，右键锁定 + 射程 + 冷却）。
+  - **技能 1（Q）直线弹道（skillshot）**：发射 `Projectile`，命中首个敌人结算伤害（+ 可选减速/击退）。
+  - **技能 2（E）范围/锥形（AoE/Cone）**：`PointTarget`，落点范围伤害 + 控制（眩晕/定身/破甲）。
+  - **技能 3（R）位移/机动（dash/blink）**：瞬间改变英雄位置，可穿地形/越墙。
+  - **终极（F）大招**：高伤 AoE / 全局支援 / 强控，长 CD。
+  - **属性缩放**：AD/AP 加成（`AbilityScaling`），伤害类型（物理/法术/真实），护甲/魔抗减免（已有 `apply_mitigated_damage`）。
+  - **控制效果系统**：新增 `Stunned` / `Rooted` / `Slowed` 状态组件 + `status_system` 管理时长与结算。
+  - **资源**：能量/法力消耗与回复（已有 `energy` 字段）。
+  - **多英雄**：定义 2-3 个英雄，各自 `default_hero_abilities()` + 数值平衡。
+
+### 5.4 地图重构细化（Map Refactor & Detailing）
+- **现状**：`map.rs` 定义 Halcyon Fold 风格静态数据（尺寸、基地、12 塔、野怪营地、兵线、草丛、视野常量），但兵线/基地/野区逻辑较简；小兵生成仍是 TODO。
+- **目标**：完整、可玩、有明确分路与战略点的 3v3 地图：
+  - **三路兵线**（上/中/下）：`minion_paths()` 路点寻路，双方对称；兵线交汇、推进。
+  - **野区**：4 象限野怪营地（已部分实现），补充 buff 怪（红/蓝增益）、大型野怪（Kraken / Gold Mine 全局事件）。
+  - **河道与机制**：中央河道 + 周期性增益刷新点；高低差形成视野/战术点。
+  - **防御结构**：外塔/内塔/基地塔 + Vain Crystal，摧毁逻辑与奖励（已有 `Turret`/`VainCrystal` 类型，需补摧毁与推进）。
+  - **草丛与视野**：草丛提供隐匿（脱离敌方视野不进快照/不渲染），配合高度起伏形成视野遮挡；实现简易 fog-of-war / 视野剔除（与 AOI 裁剪结合）。
+  - **小地图与导航**：右上角小地图标注兵线/野区/塔状态；寻路避免穿墙（结合地形坡度）。
+  - **对称与平衡**：以中心轴镜像对称，保证双方公平。
+
+**建议优先级**：先 5.1 地形（影响所有坐标/碰撞/技能判定）→ 5.4 地图结构 → 5.3 技能（战斗核心）→ 5.2 贴图（表现层）。
+
+---
+
+## 六、如何启动与编译
 
 ### 环境要求
 - Rust ≥ 1.85（`edition = "2024"`，`rustup update stable`）。
@@ -200,7 +286,7 @@ vainglory/
 
 ---
 
-## 五、常见问题 / 排错
+## 七、常见问题 / 排错
 
 - **看不到英雄 / 地图（3D 场景空白，但 UI 面板正常）**
   1. **端口 5000 被旧服务端占用**：若之前启动过服务端但没关，新服务端会在 `start_server` 绑定 UDP 时**报错退出**（现已改为打印中文错误并 `exit(1)`，而非静默 panic），导致英雄无法生成。解决办法：先结束所有残留的 `vainglory-server` 进程，再只启动**一个**服务端。

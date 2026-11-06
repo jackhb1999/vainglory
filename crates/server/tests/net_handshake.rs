@@ -72,6 +72,7 @@ fn send_input(c: &mut TestClient, dir: Vec2f) {
         move_dir: dir,
         aim_dir: Vec2f::zero(),
         ability_mask: 0,
+        target_net_id: None,
         ping: 0,
     };
     let bytes = bitcode::encode(&ClientMessage::Input(cmd));
@@ -86,6 +87,7 @@ fn send_input_full(c: &mut TestClient, dir: Vec2f, aim: Vec2f, mask: u8) {
         move_dir: dir,
         aim_dir: aim,
         ability_mask: mask,
+        target_net_id: None,
         ping: 0,
     };
     let bytes = bitcode::encode(&ClientMessage::Input(cmd));
@@ -437,6 +439,34 @@ fn training_dummy_takes_damage() {
     assert!(
         app.world().get_entity(dummy).is_ok(),
         "训练假人在掉血后不应被销毁"
+    );
+}
+
+/// 确认服务端在结算伤害后会广播 `DamageDealt` 事件（客户端据此显示伤害数字 / 受击反馈）。
+#[test]
+fn damage_emits_damage_dealt_event() {
+    use server::networking::ServerEvents;
+
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .init_resource::<DamageSink>()
+        .init_resource::<ServerEvents>();
+
+    let attacker = app.world_mut().spawn((NetId(1),)).id();
+    let target = app.world_mut().spawn((NetId(2),)).id();
+
+    app.world_mut()
+        .resource_mut::<DamageSink>()
+        .0
+        .push((attacker, target, 123.0, DamageType::Physical));
+
+    app.add_systems(Update, flush_damage_events);
+    app.update();
+
+    let events = app.world().resource::<ServerEvents>();
+    assert!(
+        events.0.iter().any(|e| matches!(e, GameEvent::DamageDealt { damage, .. } if *damage == 123.0)),
+        "服务端应向客户端广播 DamageDealt 事件"
     );
 }
 

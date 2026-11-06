@@ -5,6 +5,11 @@ use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use crate::net::JungleMonsterType;
 
+/// 伤害结算时回填的事件汇（attacker, target, 实际伤害, 伤害类型），
+/// 由服务端的 flush_damage_events 系统转换为 `GameEvent::DamageDealt` 广播给客户端。
+#[derive(Default, Resource)]
+pub struct DamageSink(pub Vec<(Entity, Entity, f32, DamageType)>);
+
 /// 阵营
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub enum Team {
@@ -46,6 +51,8 @@ pub struct Hero {
     pub attack_speed: f32,
     pub move_speed: f32,
     pub attack_range: f32,
+    /// 普攻冷却计时（秒），>0 时不可普攻。由 attack_system 递减。
+    pub attack_cooldown: f32,
 }
 
 impl Default for Hero {
@@ -66,6 +73,7 @@ impl Default for Hero {
             attack_speed: 1.0,
             move_speed: 3.5,
             attack_range: 5.5,
+            attack_cooldown: 0.0,
         }
     }
 }
@@ -244,7 +252,8 @@ pub struct ActiveItem {
 pub struct PlayerInput {
     pub move_dir: Vec2,
     pub aim_dir: Vec2,
-    pub ability_mask: u8, // bitmask for abilities 0-3
+    pub ability_mask: u8, // bitmask for abilities 0-3；bit0 预留给普攻
+    pub target_net_id: Option<NetId>, // 锁定的普攻目标
     pub tick: u64,
 }
 
@@ -254,6 +263,7 @@ impl Default for PlayerInput {
             move_dir: Vec2::ZERO,
             aim_dir: Vec2::X,
             ability_mask: 0,
+            target_net_id: None,
             tick: 0,
         }
     }

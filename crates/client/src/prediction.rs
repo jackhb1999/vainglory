@@ -63,6 +63,7 @@ fn apply_prediction(
             move_dir: input_state.move_dir.into(),
             aim_dir: input_state.aim_dir.into(),
             ability_mask: input_state.ability_mask,
+            target_net_id: input_state.target_net_id.map(|n| n.0),
             ping: 0,
         };
         
@@ -85,11 +86,17 @@ fn apply_prediction(
                 sync.last_update_tick = pred_state.local_tick;
             }
             
-            // 朝向更新
+            // 朝向更新：cmd.aim_dir 是地面世界坐标点，朝向 = 该点 - 自身位置
             if cmd.aim_dir != Vec2f::zero() {
-                let angle = cmd.aim_dir.y.atan2(cmd.aim_dir.x);
-                transform.rotation = Quat::from_rotation_y(-angle);
-                sync.rotation = transform.rotation;
+                let dir = Vec2::new(
+                    cmd.aim_dir.x - transform.translation.x,
+                    cmd.aim_dir.y - transform.translation.z,
+                );
+                if dir.length_squared() > 1e-6 {
+                    let angle = dir.y.atan2(dir.x);
+                    transform.rotation = Quat::from_rotation_y(-angle);
+                    sync.rotation = transform.rotation;
+                }
             }
         }
     }

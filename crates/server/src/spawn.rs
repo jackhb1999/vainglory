@@ -35,7 +35,7 @@ impl Plugin for SpawnPlugin {
     }
 }
 
-/// 在双方出生点前方与河道中心各放一个训练假人（中立阵营），供单人测试技能命中。
+/// 只放一个训练假人（中立阵营），放在河道中心，供单人测试技能命中。
 fn spawn_training_dummies(
     mut commands: Commands,
     mut next_net_id: ResMut<NextNetId>,
@@ -49,9 +49,7 @@ fn spawn_training_dummies(
     }
     flags.dummies = true;
     let positions = [
-        Vec3::new(-15.0, 0.0, -12.0), // 蓝方出生点前方
-        Vec3::new(15.0, 0.0, 12.0),   // 红方出生点前方
-        Vec3::new(0.0, 0.0, 0.0),     // 河道中心
+        Vec3::new(0.0, 0.0, 0.0), // 河道中心，单个假人
     ];
 
     for pos in positions {
@@ -66,10 +64,14 @@ fn spawn_training_dummies(
                 position: pos,
                 ..default()
             },
+            Selectable {
+                radius: 1.5,
+                height: 3.0,
+            },
             Hero {
                 name: "训练假人".to_string(),
-                health: 5000.0,
-                max_health: 5000.0,
+                health: 600.0,
+                max_health: 600.0,
                 move_speed: 0.0,
                 ..default()
             },

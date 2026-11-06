@@ -9,12 +9,32 @@
 
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
+use game_core::abilities::{default_hero_abilities, get_ability_def};
 use game_core::components::{LocalPlayer, NetId, Selectable};
 use crate::rendering::{HitFlash, TargetMarker};
 
 /// 当前锁定的攻击目标（net id），右键敌人时设置，用于显示选中环。
 #[derive(Resource, Default)]
 pub struct SelectedTarget(pub Option<NetId>);
+
+/// 技能瞄准 / 目标选取状态：按下 Q/E/R/F 进入对应技能槽的瞄准模式。
+/// `target_point` 为光标在地面上的命中点（用于范围指示），
+/// `hovered` 为射程内、光标附近的可选实体（用于高亮），点击即对该目标施放。
+#[derive(Resource, Default)]
+pub struct TargetingState {
+    pub slot: Option<u8>,
+    pub target_point: Option<Vec3>,
+    pub hovered: Option<NetId>,
+}
+
+/// 一次已确认的施放请求。点击确认后产生，`send_input` 连续发送若干帧，
+/// 保证服务端 `ability_cast_system` 至少在一个 tick 收到该次施放。
+#[derive(Resource, Default)]
+pub struct PendingCast {
+    pub slot: Option<u8>,
+    pub aim: Vec2,
+    pub frames: u8,
+}
 
 pub struct InputPlugin;
 
@@ -24,13 +44,16 @@ impl Plugin for InputPlugin {
             .init_resource::<LocalPlayerTransform>()
             .init_resource::<MoveTarget>()
             .init_resource::<SelectedTarget>()
-            .add_systems(Startup, spawn_move_target_marker)
+            .init_resource::<TargetingState>()
+            .init_resource::<PendingCast>()
+            .add_systems(Startup, (spawn_move_target_marker, spawn_cursor_marker))
             .add_systems(
                 Update,
                 (
                     update_local_player_transform,
                     handle_input,
                     update_move_target_marker,
+                    update_cursor_marker,
                 )
                     .chain(),
             )
@@ -57,9 +80,8 @@ fn spawn_move_target_marker(
             base_color: Color::srgb(1.0, 0.85, 0.2),
             ..default()
         })),
-        // 平铺在地面上
-        Transform::from_xyz(0.0, 0.2, 0.0)
-            .with_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2)),
+        // 平铺在地面上（Torus 默认即躺在 XZ 平面，无需额外旋转）
+        Transform::from_xyz(0.0, 0.2, 0.0),
         Visibility::Hidden,
         MoveTargetMarker,
     ));
@@ -78,6 +100,62 @@ fn update_move_target_marker(
             transform.translation = Vec3::new(target.x, 0.2, target.y);
         } else {
             *visibility = Visibility::Hidden;
+        }
+    }
+}
+
+/// 跟随鼠标在地面上的光标高亮（青色细环）。
+/// 用于诊断“攻击没落在鼠标点击处”到底是【鼠标位置没感知对】还是【释放逻辑算错】：
+/// - 高亮正确跟随鼠标 → 鼠标感知 OK，问题在释放逻辑；
+/// - 高亮不动 / 明显错位 → 鼠标坐标→世界坐标的射线投射(ground_hit)有问题。
+#[derive(Component)]
+pub struct CursorMarker;
+
+fn spawn_cursor_marker(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.spawn((
+        Mesh3d(meshes.add(Torus {
+            major_radius: 0.9,
+            minor_radius: 0.12,
+        })),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.2, 0.9, 1.0),
+            emissive: Color::srgb(0.1, 0.6, 0.8).into(),
+            ..default()
+        })),
+        Transform::from_xyz(0.0, 0.06, 0.0),
+        CursorMarker,
+    ));
+}
+
+/// 每帧把光标高亮放到“鼠标在地面上的命中点”，与点击移动/技能落点共用同一套 ground_hit。
+fn update_cursor_marker(
+    windows: Query<&Window>,
+    camera: Query<&Camera>,
+    camera_xform: Query<&GlobalTransform, With<Camera>>,
+    mut marker: Query<
+        &mut Transform,
+        (
+            With<CursorMarker>,
+            Without<MoveTargetMarker>,
+            Without<HitFlash>,
+            Without<TargetMarker>,
+            Without<Camera3d>,
+        ),
+    >,
+) {
+    if let Ok(mut transform) = marker.single_mut() {
+        if let (Ok(window), Ok(camera), Ok(cam_xform)) =
+            (windows.single(), camera.single(), camera_xform.single())
+        {
+            if let Some(cursor) = window.cursor_position() {
+                if let Some(hit) = ground_hit(camera, cam_xform, cursor) {
+                    transform.translation = Vec3::new(hit.x, 0.06, hit.z);
+                }
+            }
         }
     }
 }
@@ -104,6 +182,8 @@ pub struct PlayerInputState {
     pub move_dir: Vec2,
     pub aim_dir: Vec2,
     pub ability_mask: u8,
+    /// 锁定的普攻目标（NetId）。右键敌人时设置，普攻/自动攻击优先打它。
+    pub target_net_id: Option<NetId>,
     pub is_dragging_ability: bool,
     pub drag_start: Vec2,
     pub selected_ability: Option<u8>,
@@ -134,6 +214,8 @@ fn handle_input(
     mut input_state: ResMut<PlayerInputState>,
     mut move_target: ResMut<MoveTarget>,
     mut selected: ResMut<SelectedTarget>,
+    mut targeting: ResMut<TargetingState>,
+    mut pending: ResMut<PendingCast>,
     heroes: Query<(Entity, &Transform, &NetId, &Selectable)>,
     egui_ctx: Option<NonSendMut<EguiContexts>>,
 ) {
@@ -160,11 +242,31 @@ fn handle_input(
         move_target.0 = None;
     }
 
-    // --- 2. 左键点击地面：设置移动目标（点 UI 时不触发）---
+    // --- 2. 左键：瞄准模式下确认施放；否则点击移动（点 UI 时不触发）---
     let over_ui = egui_ctx
         .map_or(false, |mut ctx| ctx.ctx_mut().map_or(false, |c| c.is_pointer_over_egui()));
     if !over_ui && mouse_buttons.just_pressed(MouseButton::Left) {
-        if let (Ok(window), Ok(camera), Ok(cam_xform)) =
+        if let Some(slot) = targeting.slot {
+            // 确认施放：朝悬停敌人（优先）或光标地面点
+            let mut aim = Vec2::ZERO;
+            if let Some(hit) = targeting.target_point {
+                let point = if let Some(nid) = targeting.hovered {
+                    heroes
+                        .iter()
+                        .find(|(_, _, n, _)| **n == nid)
+                        .map(|(_, t, _, _)| t.translation)
+                        .unwrap_or(hit)
+                } else {
+                    hit
+                };
+                // 记录鼠标的绝对地面世界坐标（x,z），由服务端按射程夹紧后作为落点
+                aim = Vec2::new(point.x, point.z);
+            }
+            pending.slot = Some(slot);
+            pending.aim = aim;
+            pending.frames = 3; // 连续发送若干帧，确保服务端收到
+            targeting.slot = None;
+        } else if let (Ok(window), Ok(camera), Ok(cam_xform)) =
             (windows.single(), camera.single(), camera_xform.single())
         {
             if let Some(cursor) = window.cursor_position() {
@@ -192,29 +294,74 @@ fn handle_input(
     };
     input_state.move_dir = move_dir;
 
-    // --- 4. 技能按键 ---
-    // bit0 预留给普攻（右键触发）。技能占用 bit1..=bit4，对应 4 个技能槽。
-    // 为避免与方向键（WASD/方向键）冲突且不做重复绑定，仅用 Q/E/R/F。
-    let mut ability_mask = 0u8;
-    if keys.pressed(KeyCode::KeyQ) {
-        ability_mask |= 0b0010; // 槽 0
-    }
-    if keys.pressed(KeyCode::KeyE) {
-        ability_mask |= 0b0100; // 槽 1
-    }
-    if keys.pressed(KeyCode::KeyR) {
-        ability_mask |= 0b1000; // 槽 2
-    }
-    if keys.pressed(KeyCode::KeyF) {
-        ability_mask |= 0b0001_0000; // 槽 3
-    }
-    // 右键 = 普攻（bit0）
-    if mouse_buttons.pressed(MouseButton::Right) {
-        ability_mask |= 0b0001;
-    }
-    input_state.ability_mask = ability_mask;
+    // --- 4. 技能按键：进入“目标选取”瞄准模式 ---
+    // 按 Q/E/R/F 进入对应技能槽的瞄准模式（再按一次或 Esc 取消）。
+    // 瞄准模式会出现范围指示环与可攻击目标高亮；左键确认后由 `PendingCast` 触发施放。
+    // （不再用按住即放的方式，避免无目标时把技能打空且没有任何反馈。）
+    let pressed_q = keys.just_pressed(KeyCode::KeyQ);
+    let pressed_e = keys.just_pressed(KeyCode::KeyE);
+    let pressed_r = keys.just_pressed(KeyCode::KeyR);
+    let pressed_f = keys.just_pressed(KeyCode::KeyF);
+    let pressed_esc = keys.just_pressed(KeyCode::Escape);
 
-    // --- 7. 右键敌人：锁定攻击目标（显示选中环，并让瞄准方向指向目标）---
+    if pressed_esc {
+        targeting.slot = None;
+    }
+    let entered = if pressed_q {
+        Some(0)
+    } else if pressed_e {
+        Some(1)
+    } else if pressed_r {
+        Some(2)
+    } else if pressed_f {
+        Some(3)
+    } else {
+        None
+    };
+    if let Some(slot) = entered {
+        // 同一技能键再次按下 = 取消瞄准
+        targeting.slot = if targeting.slot == Some(slot) {
+            None
+        } else {
+            Some(slot)
+        };
+    }
+
+    // 计算光标地面命中点与射程内悬停目标（供范围指示与确认施放使用）
+    targeting.target_point = None;
+    targeting.hovered = None;
+    if let Some(slot) = targeting.slot {
+        if let (Ok(window), Ok(camera), Ok(cam_xform)) =
+            (windows.single(), camera.single(), camera_xform.single())
+        {
+            if let Some(cursor) = window.cursor_position() {
+                if let Some(hit) = ground_hit(camera, cam_xform, cursor) {
+                    targeting.target_point = Some(hit);
+                    let range = get_ability_def(default_hero_abilities()[slot as usize]).range;
+                    let player_xz = Vec2::new(player_pos.x, player_pos.z);
+                    if (Vec2::new(hit.x, hit.z) - player_xz).length() <= range + 4.0 {
+                        let mut best: Option<NetId> = None;
+                        let mut best_d = f32::MAX;
+                        for (_, htr, net_id, sel) in heroes.iter() {
+                            let d = (Vec2::new(hit.x, hit.z)
+                                - Vec2::new(htr.translation.x, htr.translation.z))
+                                .length();
+                            if d < sel.radius + 3.0 && d < best_d {
+                                best_d = d;
+                                best = Some(*net_id);
+                            }
+                        }
+                        targeting.hovered = best;
+                    }
+                }
+            }
+        }
+    }
+
+    // 本帧的 ability_mask 由 PendingCast 驱动（send_input 读取），这里不再自动置位
+    input_state.ability_mask = 0;
+
+    // --- 7. 右键敌人：锁定普攻目标（显示选中环 + 朝它移动 + 持续普攻）---
     if !over_ui && mouse_buttons.just_pressed(MouseButton::Right) {
         if let (Ok(window), Ok(cam), Ok(cam_xform)) =
             (windows.single(), camera.single(), camera_xform.single())
@@ -222,6 +369,7 @@ fn handle_input(
             if let Some(cursor) = window.cursor_position() {
                 if let Some(hit) = ground_hit(cam, cam_xform, cursor) {
                     let mut best: Option<NetId> = None;
+                    let mut best_pos: Option<Vec3> = None;
                     let mut best_d = f32::MAX;
                     for (_, htr, net_id, sel) in heroes.iter() {
                         let d = (Vec2::new(hit.x, hit.z)
@@ -231,9 +379,16 @@ fn handle_input(
                         if d < sel.radius + 3.0 && d < best_d {
                             best_d = d;
                             best = Some(*net_id);
+                            best_pos = Some(htr.translation);
                         }
                     }
                     selected.0 = best;
+                    // 锁定目标 → 持续普攻它；点空地 → 取消锁定、停止普攻
+                    input_state.target_net_id = best;
+                    match best_pos {
+                        Some(p) => move_target.0 = Some(Vec2::new(p.x, p.z)),
+                        None => move_target.0 = None,
+                    }
                     if let Some(t) = best {
                         info!("锁定攻击目标: {:?}", t);
                     }
@@ -242,14 +397,19 @@ fn handle_input(
         }
     }
 
+    // --- 8. 锁定了普攻目标时，置位普攻位（bit0），让服务端 attack_system 持续攻击它 ---
+    if input_state.target_net_id.is_some() {
+        input_state.ability_mask |= 0b0001;
+    }
+
     // --- 5. 瞄准方向：鼠标指向的地面点 ---
     if let (Ok(window), Ok(camera), Ok(cam_xform)) =
         (windows.single(), camera.single(), camera_xform.single())
     {
         if let Some(cursor) = window.cursor_position() {
             if let Some(hit) = ground_hit(camera, cam_xform, cursor) {
-                let aim = Vec2::new(hit.x - player_pos.x, hit.z - player_pos.z);
-                input_state.aim_dir = aim.normalize_or_zero();
+                // 记录鼠标绝对地面世界坐标（x,z），朝向/落点都据此推导
+                input_state.aim_dir = Vec2::new(hit.x, hit.z);
             }
         }
     }
@@ -269,7 +429,9 @@ fn handle_input(
             } else {
                 let aim_dir = (pos - Vec2::new(screen_width * 0.5, screen_height * 0.5))
                     .normalize_or_zero();
-                input_state.aim_dir = aim_dir;
+                // aim_dir 现在表示世界坐标点：以玩家为中心、朝触摸方向延伸 10 单位
+                input_state.aim_dir =
+                    Vec2::new(player_pos.x, player_pos.z) + aim_dir * 10.0;
             }
         }
     }
@@ -383,6 +545,8 @@ mod tests {
         world.init_resource::<MoveTarget>();
         world.init_resource::<SelectedTarget>();
         world.init_resource::<LocalPlayerTransform>();
+        world.init_resource::<TargetingState>();
+        world.init_resource::<PendingCast>();
 
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyW);

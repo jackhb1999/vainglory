@@ -16,7 +16,7 @@ use game_core::net::{
     ClientMessage, GameEvent, InputCmd, MatchState, PROTOCOL_VERSION, ServerMessage, WorldSnapshot,
 };
 use game_core::components::*;
-use crate::rendering::make_hero_texture;
+use crate::rendering::{make_hero_texture, CastEffect, DamageFlash, HitFlash};
 use bitcode;
 
 /// 网络连接状态（同时是 Resource 与 States，供 lib.rs 的 OnEnter 调度使用）
@@ -396,6 +396,48 @@ fn handle_game_event(
         GameEvent::MatchEnd { winning_team } => {
             info!("Match ended! Winner: {:?}", winning_team);
         }
+        // 技能释放落点：展示一次范围闪光，作为“技能已释放”的可见反馈
+        GameEvent::AbilityCast {
+            target_position, ..
+        } => {
+            let pos = target_position.to_vec3();
+            commands.spawn((
+                Mesh3d(meshes.add(Torus {
+                    major_radius: 1.0,
+                    minor_radius: 0.2,
+                })),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(1.0, 0.9, 0.3),
+                    emissive: Color::srgb(0.8, 0.7, 0.1).into(),
+                    ..default()
+                })),
+                Transform::from_translation(pos + Vec3::Y * 0.3),
+                CastEffect {
+                    t: 0.5,
+                    max: 0.5,
+                    radius: 4.0,
+                },
+            ));
+        }
+        // 造成伤害：受击脉冲 + 上浮放大的红色闪光环（作为目标实体子节点自动跟随）
+        GameEvent::DamageDealt { target, damage, .. } => {
+            if let Some(&e) = hero_registry.0.get(&target) {
+                commands.entity(e).try_insert(HitFlash { t: 0.25 });
+                commands.entity(e).with_child((
+                    Mesh3d(meshes.add(Torus {
+                        major_radius: 1.0,
+                        minor_radius: 0.2,
+                    })),
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: Color::srgb(1.0, 0.2, 0.2),
+                        emissive: Color::srgb(0.8, 0.0, 0.0).into(),
+                        ..default()
+                    })),
+                    Transform::from_translation(Vec3::Y * 4.0),
+                    DamageFlash { ttl: 1.0 },
+                ));
+            }
+        }
         _ => {}
     }
 }
@@ -405,6 +447,7 @@ fn send_input(
     client_res: Option<ResMut<RenetClientResource>>,
     transport_res: Option<ResMut<ClientTransportResource>>,
     input: Res<crate::input::PlayerInputState>,
+    pending: Option<ResMut<crate::input::PendingCast>>,
 ) {
     let (Some(mut client_res), Some(mut transport_res)) = (client_res, transport_res) else {
         return;
@@ -416,11 +459,28 @@ fn send_input(
         return;
     }
 
+    // 已确认（点击）的技能施放：连续若干帧发送，确保服务端至少在一个 tick 收到。
+    // PendingCast 由 InputPlugin 初始化；无 InputPlugin 的 headless 环境下为 None（不施放技能）。
+    let mut mask = 0u8;
+    let mut aim = input.aim_dir;
+    if let Some(mut pending) = pending {
+        if let Some(slot) = pending.slot {
+            let slot = slot; // 复制出来，避免与下方对 pending 的可变借用冲突
+            mask |= 1u8 << (slot + 1);
+            aim = pending.aim;
+            pending.frames = pending.frames.saturating_sub(1);
+            if pending.frames == 0 {
+                pending.slot = None;
+            }
+        }
+    }
+
     let cmd = InputCmd {
         tick: 0,
         move_dir: input.move_dir.into(),
-        aim_dir: input.aim_dir.into(),
-        ability_mask: input.ability_mask,
+        aim_dir: aim.into(),
+        ability_mask: mask,
+        target_net_id: input.target_net_id.map(|n| n.0),
         ping: 0,
     };
 

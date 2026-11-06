@@ -138,18 +138,32 @@ fn store_snapshot_history(
 fn interpolate_entities(
     tick_clock: Res<TickClock>,
     history: Res<EntityHistory>,
-    mut query: Query<(&mut Transform, &mut TransformSync, &NetId), With<Interpolated>>,
+    mut query: Query<(&mut Transform, &mut TransformSync, &NetId, Option<&mut Hero>), With<Interpolated>>,
 ) {
     let target_tick = tick_clock.current_tick;
     let alpha = tick_clock.interpolation_alpha();
     
-    for (mut transform, mut sync, net_id) in query.iter_mut() {
+    for (mut transform, mut sync, net_id, hero) in query.iter_mut() {
         if let Some(interpolated) = history.get_interpolated(*net_id, target_tick, alpha) {
             transform.translation = interpolated.position.into();
             transform.rotation = interpolated.rotation.into();
             sync.position = interpolated.position.into();
             sync.rotation = interpolated.rotation.into();
             sync.velocity = interpolated.velocity.into();
+            // 从服务端快照同步血量（敌方英雄 / 训练假人均为 Interpolated，仅本地玩家是 Predicted 故被排除），
+            // 否则敌人血量永远停留在初始值，血条看着“不掉血”。
+            if let Some(mut hero) = hero {
+                hero.health = interpolated.health;
+                hero.max_health = interpolated.max_health;
+                if hero.health < hero.max_health - 0.5 {
+                    info!(
+                        "[CLT-INT] net={:?} health={:.1}/{:.1}",
+                        net_id, hero.health, hero.max_health
+                    );
+                }
+            }
+        } else if hero.is_some() {
+            info!("[CLT-INT] NO HISTORY for net={:?}", net_id);
         }
     }
 }

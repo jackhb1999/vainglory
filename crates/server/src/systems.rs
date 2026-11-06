@@ -56,12 +56,19 @@ pub fn ability_cast_system(
             abilities.cooldowns[slot as usize] = def.cooldown;
 
             let caster_pos = transform.translation;
-            // 瞄准方向（世界 x,z 平面，归一化）
-            let aim = if input.aim_dir.length_squared() > 0.0 {
-                Vec3::new(input.aim_dir.x, 0.0, input.aim_dir.y).normalize()
+            // aim_dir 现在是鼠标在地面上的绝对世界坐标 (x,z)
+            let target = Vec3::new(input.aim_dir.x, 0.0, input.aim_dir.y);
+            let to_target = target - caster_pos;
+            let dist = to_target.length();
+            // 瞄准方向（世界 x,z 平面，归一化）；无有效目标时兜底朝前
+            let aim = if dist > 1e-4 {
+                to_target / dist
             } else {
-                Vec3::new(0.0, 0.0, -1.0) // 兜底：朝前方
+                Vec3::new(0.0, 0.0, -1.0)
             };
+            // 落点：沿瞄准方向，取“点击距离”与“技能射程”的较小值
+            // → 落在鼠标点击处；超出射程则压到射程边缘（与客户端范围环一致）
+            let center = caster_pos + aim * dist.min(def.range);
             let damage = def.damage(hero.attack_damage, hero.ability_power);
 
             match def.cast_type {
@@ -97,8 +104,7 @@ pub fn ability_cast_system(
                         // 瞬发治疗
                         hero.health = (hero.health + def.heal_amount).min(hero.max_health);
                     } else {
-                        // 指向/瞬发 AoE：在落点对范围内敌人施加待结算伤害
-                        let center = caster_pos + aim * def.range;
+                        // 指向/瞬发 AoE：在落点（已按射程夹紧）对范围内敌人施加待结算伤害
                         for (e_ent, e_pos, e_team) in &enemy_snapshot {
                             if *e_team == *team {
                                 continue;
@@ -118,7 +124,7 @@ pub fn ability_cast_system(
             server_events.0.push(GameEvent::AbilityCast {
                 caster: *net_id,
                 ability_index: slot,
-                target_position: Vec3f::from_vec3(caster_pos + aim * def.range),
+                target_position: Vec3f::from_vec3(center),
                 target_entity: None,
             });
         }
@@ -184,12 +190,43 @@ pub fn projectile_system(
 pub fn resolve_pending_hits(
     mut commands: Commands,
     mut hits: Query<(Entity, &mut Hero, &PendingHit, Option<&TrainingDummy>)>,
+    mut damage_sink: Option<ResMut<game_core::components::DamageSink>>,
 ) {
     for (entity, mut hero, hit, dummy) in hits.iter_mut() {
-        apply_mitigated_damage(&mut hero, hit.damage, hit.damage_type);
+        let dealt = apply_mitigated_damage(&mut hero, hit.damage, hit.damage_type);
+        if let Some(sink) = damage_sink.as_deref_mut() {
+            sink.0.push((hit.attacker, entity, dealt, hit.damage_type));
+        }
         if hero.health <= 0.0 && dummy.is_none() {
             commands.entity(entity).despawn();
         }
         commands.entity(entity).remove::<PendingHit>();
+    }
+}
+
+/// 把本帧累积的伤害事件（DamageSink）转换为 `GameEvent::DamageDealt` 广播给客户端，
+/// 让攻击方也能看到伤害数字与受击反馈。
+pub fn flush_damage_events(
+    mut damage_sink: Option<ResMut<game_core::components::DamageSink>>,
+    net_ids: Query<(Entity, &NetId)>,
+    mut server_events: ResMut<ServerEvents>,
+) {
+    let Some(mut sink) = damage_sink else {
+        return;
+    };
+    if sink.0.is_empty() {
+        return;
+    }
+    let id_map: std::collections::HashMap<Entity, NetId> =
+        net_ids.iter().map(|(e, n)| (e, *n)).collect();
+    for (attacker, target, dealt, _dtype) in sink.0.drain(..) {
+        if let (Some(a), Some(t)) = (id_map.get(&attacker), id_map.get(&target)) {
+            server_events.0.push(GameEvent::DamageDealt {
+                attacker: *a,
+                target: *t,
+                damage: dealt,
+                is_critical: false,
+            });
+        }
     }
 }
