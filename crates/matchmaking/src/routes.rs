@@ -1,11 +1,16 @@
 //! HTTP 路由
 
-use axum::{Router, routing::{get, post}, Json, extract::State};
-use serde::{Deserialize, Serialize};
-use crate::store::MatchStore;
 use crate::queue::MatchQueue;
+use crate::store::MatchStore;
+use axum::{
+    Json, Router,
+    extract::State,
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct AppState {
     pub store: MatchStore,
     pub queue: MatchQueue,
@@ -16,7 +21,7 @@ pub fn build_router() -> Router {
         store: MatchStore::new(),
         queue: MatchQueue::new(),
     };
-    
+
     Router::new()
         .route("/health", get(health))
         .route("/queue/join", post(join_queue))
@@ -91,7 +96,7 @@ async fn match_status(
 ) -> Json<MatchStatusResponse> {
     let player_id = params.get("player_id").cloned().unwrap_or_default();
     let (in_queue, match_id, server_address) = state.queue.get_status(&player_id).await;
-    
+
     Json(MatchStatusResponse {
         in_queue,
         match_id,

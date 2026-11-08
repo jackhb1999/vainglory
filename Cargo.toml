@@ -1,19 +1,27 @@
 [workspace]
 resolver = "2"
-members = ["crates/game-core", "crates/client", "crates/server", "crates/matchmaking"]
+members = [
+    "crates/game-core",
+    "crates/client",
+    "crates/server",
+    "crates/matchmaking",
+    "crates/gx-net",
+    "crates/gx-config",
+    "crates/gx-proto-content",
+    "crates/gx-e2e",
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Vainglory Rust reimplementation"
+description = "GX-01: original-expression 3v3 team arena (rules-level reference only)"
 
 [workspace.dependencies]
 bevy = { version = "0.20.1", features = ["debug"] }
 bevy_egui = "0.43"
 renet2 = "0.12"
 renet2_netcode = "0.12"
-bevy_renet2 = "1.0"
 bitcode = "0.6"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
@@ -25,8 +33,12 @@ fixed = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 axum = "0.7"
 uuid = { version = "1.0", features = ["v4", "serde"] }
-redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
-glam = { version = "0.34",features = ["serde"] }
+
+# Bevy ECS 系统签名天然包含复杂 Query 类型与多个 SystemParam 参数。
+# 集中允许这两类风格 lint；其余所有 warning 仍由 CI 的 `-D warnings` 阻断。
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
 
 [profile.dev]
 opt-level = 1

@@ -3,10 +3,14 @@
 | 项 | 内容 |
 |---|---|
 | 文档编号 | `GX-DEV-2026-001` |
-| 版本 / 日期 | v1.0 / 2026-11-06 |
-| 上游 | `GX-TF-2026-001`（闸门与预算）、`GX-ARCH-2026-001`（架构与 DN）、`GX-PRD-2026-001`（需求基线） |
+| 版本 / 日期 | v1.1 / 2026-11-07 |
+| 上游 | `GX-TF-2026-001`（闸门与预算）、`GX-ARCH-2026-001`（架构与 DN）、`GX-PRD-2026-001`（需求基线）、`GX-CBT-2026-001`（对战详细规格） |
 | 对应 | 本文档是 `GX-PRD-2026-001` 的**实现侧文档**：每条 `FR/NFR/CR` 均可经本文档的 `DEV` 任务与 `TC` 用例反向追溯 |
 | 适用对象 | 客户端 / 服务端 / 后端 / 工具链工程师、QA、技术美术、技术策划 |
+
+> **v1.1 范围变更**：按本轮新指令，玩法逻辑闭环（`DEV-12~16` 的核心规则部分）已由 M2 提前落地，
+> 接口与系统链见 `GX-CBT-2026-001` §22，逐条剩余差距见其 §23，寻路 M2 待办规格见 §24。
+> 本次交付边界、闸门与排期的**正式修订仍以 `GX-PRD-2026-001` §11.1 为准**；本文件未擅自改动 `G0/G1/G2` 定义。
 
 ---
 
@@ -34,7 +38,7 @@ GX-PRD-2026-001 需求（要交付什么、验收标准）  ←→  GX-DEV-2026-
 | 依赖锁定 | 提交 `Cargo.lock`；禁止在 CI 里 `cargo update` | DN-36 / NFR-09 |
 | Workspace | 根 `Cargo.toml` 用 `[workspace.dependencies]` 统一版本；各 crate 用 `workspace = true` | 现状已部分如此 |
 | 格式化 / Lint | `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings` | CI |
-| 本地一键调试 | `cargo run -p gx-client --features offline-dev` + `cargo run -p gx-battle --features offline-dev`；**无需任何后端服务** | AS-05 / DN-21 / DN-40 |
+| 本地一键调试 | M0+M1：`cargo run -p client --features offline-dev` + `cargo run -p server --features offline-dev`；M2 后为目标名 `gx-client` / `gx-battle`；**无需任何后端服务** | AS-05 / DN-21 / DN-40 |
 | 日志 | `tracing` + `RUST_LOG`；结构化字段 `encounter_id/player_id/tick/event_id`；禁止 `println!` 调试残留 | DN-10 |
 | 网络损伤测试 | 本地代理可注入 RTT / 抖动 / 丢包（150ms / 50ms / 3% 为基线档） | TF-04 / TC-PRED-01 |
 | 压测 | headless `gx-battle` + 合成客户端，产出 tick P95、内存、带宽报告 | TF-01 / TC-PERF-01 |
@@ -69,16 +73,18 @@ crates/
   gx-tools/          # 回放、平衡模拟、资产 lint、协议兼容
 ```
 
+> **M0+M1 命名约定（经澄清 Q-11）**：现有 4 个 crate（`game-core` / `client` / `server` / `matchmaking`）名称**保持不变**，仅修改对外二进制名与 `description`；M1 新增的组件 crate 采用 `gx-*` 命名，完整重命名与 `game-core → gx-sim` 合并到 M2 阶段。因此 M1 的一键调试命令仍为 `cargo run -p client --features offline-dev` 与 `cargo run -p server --features offline-dev`（§1 中的 `gx-client`/`gx-battle` 为 M2 后的目标名）。
+
 ### 2.2 迁移阶段（每阶段有独立验收）
 
 | 阶段 | 动作 | 对应 DEV | 阶段验收（不可跳过） |
 |---|---|---|---|
-| **M0 合规与技术基线** | 命名/描述/二进制名清理；第三方数据隔离到 `LEGAL/`；补 `Cargo.lock`、`rust-toolchain.toml`；CI 骨架；禁词与资产门禁；临时诊断日志清理；法律意见归档 | DEV-01、DEV-26、DEV-29 | **G0**：禁词 0 命中、资产登记 100%、律师书面意见、可复现构建 |
+| **M0 合规与技术基线** | 命名/描述/二进制名清理；第三方数据隔离到 `LEGAL/`；确认 `Cargo.lock` 已跟踪、补 `rust-toolchain.toml`；CI 骨架；禁词与资产门禁；临时诊断日志清理；法律意见归档（外部依赖） | DEV-01、DEV-26、DEV-29 | **G0**：禁词 0 命中、资产登记 100%、可复现构建；律师意见由委托方提供 |
 | **M1-a 工程清理** | 移除死依赖（`bevy_renet2`/`glam`/`redis`）；解除 `client → server` 反向依赖；`interpolation` 改 `pub mod` 并注册 `InterpolationPlugin`；`ClientPlugin` 处置；README 与代码对齐 | DEV-07（部分）、DEV-29 | 全测试通过；新增"远端实体被插值"集成测试；`-D warnings` 清零 |
 | **M1-b 协议抽离** | `net.rs` → `gx-net`；删除协议中对 `bevy::math` 的直接 `From` 实现，改适配层；`game-core` 先 re-export 保持兼容；引入 `seq/checksum` 与版本协商 | DEV-03、DEV-04 | 协议单测与现有 E2E 通过；`TC-COMPAT-01` 通过 |
 | **M1-c 配置落地** | `gx-config` + `gx-proto-content`；先迁"技能数值 / 英雄基础值 / 哨塔与源核血量"三类硬编码；配置校验器接入 CI | DEV-02、DEV-10（准备） | `TC-CFG-01` 通过；代码中平衡字面量清零检查 |
-| **M1-d 网络加固** | 服务端视野裁剪；delta + 通道分级；预测/插值闭环；真实 RTT；状态恢复式重连 | DEV-05、DEV-06、DEV-07、DEV-08 | **G1**：`TC-NET-01/02/03/04`、`TC-PRED-01` 全部通过；抓包零视野外信息 |
-| **M2 垂直切片** | 兵线/营地/占领目标/哨塔/源核/胜负；3 英雄完整技能；经济与装备；双操作输入；基础局内 UI；回放；压测与成本实测 | DEV-09~DEV-16、DEV-22、DEV-23、DEV-27、DEV-30 | **G2**：`TC-SIM-01~05` 通过；产出 `cost_per_match` 实测值 |
+| **M1-d 网络加固** | 服务端视野裁剪；delta + 通道分级；预测/插值闭环；真实 RTT；状态恢复式重连 | DEV-05、DEV-06、DEV-07、DEV-08 | **G1**：`TC-NET-01/02/03/04`、`TC-PRED-01` 全部通过；抓包零视野外信息（TF-01 已按澄清 Q-03 移出 G1） |
+| **M2 垂直切片** | 兵线/营地/占领目标/哨塔/源核/胜负；3 英雄完整技能；经济与装备；**鼠标点触自动寻路输入（无键盘移动）**；基础局内 UI；回放；**TF-01 容量压测（自 G1 移入）**与成本实测 | DEV-09~DEV-16、DEV-22、DEV-23、DEV-27、DEV-30 | **G2**：`TC-SIM-01~05`、`TC-CBT-01~11` 与 `TC-PERF-01` 通过；产出 `cost_per_match` 实测值 |
 | **M3 上线就绪** | 账号实名防沉迷、支付、匹配编排、运营后台、反作弊、局外 UI、本地化、机型适配、CI/CD 完整流水线 | DEV-17~DEV-21、DEV-24、DEV-25、DEV-28 | **G3**：全部 P1 + CR + NFR 达标，合规验收签字 |
 | **M4 灰度** | 小范围放量、单位经济复核、SLO 观察 | — | **G4**：LTV > 获客成本 |
 
@@ -152,7 +158,7 @@ pub fn verify_replay(path: &Path) -> Result<ReplayDiff, ReplayError>;
 
 | ID | 任务 | 覆盖 | 阶段 | 关键实现要点 | 验收 |
 |---|---|---|---|---|---|
-| DEV-01 | 工程基线与合规清理 | CR-01、NFR-09、DN-29/30/36/37 | M0 | 名称/描述/二进制名去关联；第三方数据移入 `LEGAL/` 并由发布流水线排除；`Cargo.lock`+`rust-toolchain.toml`；清理 `[DMG]/[SNAP]/...` 临时日志 | **G0**；`TC-COMPLIANCE-01/02` |
+| DEV-01 | 工程基线与合规清理 | CR-01、NFR-09、DN-29/30/36/37 | M0 | 对外二进制名与描述去关联（**crate 名保持不变**）；第三方数据移入 `LEGAL/` 并由发布流水线排除；确认 `Cargo.lock` 已跟踪、新增 `rust-toolchain.toml`；清理 `[DMG]/[SNAP]/...` 临时日志 | **G0**（技术侧）；`TC-COMPLIANCE-01/02` |
 | DEV-02 | `gx-config` 配置框架 | FR-90/91/92、NFR-07 | M1-c | `ConfigSet{version,hash,tables}`；启动/CI 校验器；热更 API；一局内版本锁定；静态检查"代码中无平衡字面量" | `TC-CFG-01/02` |
 | DEV-03 | `gx-net` 协议演进 | FR-50/56/57、NFR-03 | M1-b | `InputCmd` 加 `seq/checksum/rtt/config_hash`；`Snapshot` 改基线+delta；`GameEvent` 补目标/结算/重连/配置不匹配事件；双版本协商 | `TC-NET-01`、`TC-COMPAT-01` |
 | DEV-04 | `Transport` 抽象与网关 | FR-62、CR-05 | M1-b / M3 | `Transport` trait；renet2_netcode 为默认实现；令牌校验替换 `Unsecure`；加密、连接/包速率限制；对外令牌地址由网关下发 | `TC-SEC-01`；压测限流生效 |
@@ -165,7 +171,7 @@ pub fn verify_replay(path: &Path) -> Result<ReplayDiff, ReplayError>;
 
 | ID | 任务 | 覆盖 | 阶段 | 关键实现要点 | 验收 |
 |---|---|---|---|---|---|
-| DEV-09 | 输入层双模 | FR-40~44、UC-01/02 | M2 | 点触（点地移动/点选目标/技能指向、多点触控）、摇杆（热区 ≥44dp）、键鼠（开发验证）、局内切换不产生位移、信号指令服务端校验 | `TC-UI-01` |
+| DEV-09 | 输入层：鼠标点触自动寻路 | FR-40~44、UC-01/02、`GX-CBT-2026-001` §3 | M2（**M1 先移除键盘移动**） | 左键点地 A* 寻路、右键点地立即移动（`force`）、右键点敌锁定普攻并自动追击、左键点敌仅选中；**键盘 W/A/S/D 与方向键不得产生 `move_dir`**；触摸点触/长按等效左右键；服务端校验速度上限与碰撞 | `TC-CBT-01/02`、`TC-UI-01` |
 | DEV-10 | 英雄与属性重构 | FR-20/21/34、FR-85 | M1-c / M2 | `Hero` 拆 `HeroBase`/`HeroState`/`Attributes`；派生属性统一计算；定位标签；双构筑至少 1 位英雄可验证 | `TC-SIM-04`、`TC-CFG-01` |
 | DEV-11 | 技能框架与状态效果 | FR-22~26 | M2 | 5 类目标类型；CD/消耗/射程/前后摇服务端校验；8 类状态效果与叠加/驱散/免疫规则；未知 id 拒绝（DN-26） | `TC-SIM-04`、`TC-SEC-01` |
 | DEV-12 | 战偶波次与林隙营地 | FR-01/02/03 | M2 | 路点来自配置；生成后 `ApplyDeferred`（DN-17）；`construct_ai_system`/`neutral_ai_system`；营地重生计时；碰撞不穿墙 | `TC-SIM-01/02` |
@@ -185,9 +191,9 @@ pub fn verify_replay(path: &Path) -> Result<ReplayDiff, ReplayError>;
 | DEV-21 | 反作弊与审计 | FR-61/63、CR-05 | M3 | 序号去重、时间窗、速度上限、CD/能量/射程二次校验；审计日志；离线行为检测 | `TC-SEC-01`、`TC-SEC-02` |
 | DEV-22 | 回放与遥测 | FR-10/16/35/63/93/94、NFR-10 | M2 / M3 | 输入流+基线+配置 hash+事件；`verify_replay` 逐 tick 比对；遥测 → 数据仓库；SLO 与告警 | `TC-SEC-02`（TF-08） |
 | DEV-23 | 局内产品 UI | FR-80~83、FR-44、FR-81 | M2 | Bevy UI 替换 egui 调试面板（ADR-09/DN-04）；HUD/小地图/商店/结算与快照一致；**小地图不显示视野外敌方** | `TC-NET-03`、`TC-UI-01` |
-| DEV-24 | 局外 UI 与本地化 | FR-84/86、CR-08 | M3 | 登录/大厅/匹配/选英雄/加载/设置；多分辨率与安全区；随包商用授权字体与加载降级（DN-06/32） | `TC-COMPLIANCE-02` |
-| DEV-25 | 渲染与机型分级 | FR-85、NFR-02/08 | M3 | 原创 3D 资产、LOD/纹理压缩/动态分辨率、机型分档；动画命中帧与服务端 tick 对齐（技术美术契约） | `TC-PERF-02`（TF-09） |
-| DEV-26 | 资产 lint 与术语门禁 | FR-96、CR-01/08、NFR-12 | M0（门禁）/ 持续 | 禁词扫描、资产来源登记、字体/音频许可、配置引用完整性；例外目录仅 `docs/` 合规留档（架构 §2.2） | `TC-COMPLIANCE-01/02`；**G0** |
+| DEV-24 | 局外 UI 与本地化 | FR-84/86、CR-08 | M3 | 登录/大厅/匹配/选英雄/加载/设置；多分辨率与安全区；UI 使用引擎内置字形的 ASCII 文案，**禁止加载操作系统字体**（DN-06/32）；多语言字形须走代码生成方案 | `TC-COMPLIANCE-02`、`TC-CBT-12` |
+| DEV-25 | 体素表现层与机型分级 | FR-85、NFR-02/08、`GX-CBT-2026-001` §16 | M3（**M1 先完成基线改造**） | Minecraft 式体素：几何/纹理/材质/图标/特效全部代码生成，零外部资源；LOD 由体素网格降采样实现、机型分档；命中反馈与服务端 tick 对齐 | `TC-CBT-12`、`TC-PERF-02`（TF-09） |
+| DEV-26 | 资产 lint 与术语门禁 | FR-96、CR-01/08、NFR-12 | M0（门禁）/ 持续 | 禁词扫描、资产来源登记、**外部资源路径扫描**（禁止运行时读取字体/图片/音频）、配置引用完整性；例外目录 `docs/**` + `LEGAL/**`（澄清 Q-10） | `TC-COMPLIANCE-01/02`、`TC-CBT-12`；**G0** |
 | DEV-27 | 测试框架与 TC 实现 | NFR-11 | M1 / M2 | 按 §5 实现全部自动化用例；headless 服务端夹具、协议回放夹具、抓包断言、网络损伤注入 | 全部 P0 用例绿灯 |
 | DEV-28 | CI/CD 与发布流水线 | NFR-09/11 | M0 骨架 / M3 完整 | 按 §6 九阶段；发布构建禁用 `dev-tools`/`offline-dev`，排除 `LEGAL/` 与第三方数据目录 | 可复现构建；G3 |
 | DEV-29 | 文档与一致性 | DN-38、AS-06 | 持续 | README 与代码同步；消除"技能已实现 vs 未完成""满 6 人 vs 1 人开局"矛盾；已知 Bug 登记 issue | 评审检查表 |
@@ -229,10 +235,13 @@ pub fn verify_replay(path: &Path) -> Result<ReplayDiff, ReplayError>;
 | TC-CFG-02 | FR-91、DN-25 | 集成 | 运行中切配置，同时在局 | 新配置只影响新对局；在局 `config_hash` 不变 |
 | TC-COMPAT-01 | FR-57 | 协议 | 新旧 `PROTOCOL_VERSION` / `config_hash` 混合 | 明确 `Reject`，不崩溃、不静默降级 |
 | TC-COMPLIANCE-01 | CR-01、NFR-12 | CI | 全仓禁词扫描（例外目录显式白名单） | 0 命中 |
-| TC-COMPLIANCE-02 | CR-08、FR-86/96 | CI + 人工 | 资产来源登记、字体/音频许可、发布包内容 | 登记 100%；发布包不含 `LEGAL/` 与第三方数据目录 |
+| TC-COMPLIANCE-02 | CR-08、FR-86/96 | CI + 人工 | 资产来源登记、**表现层来源全部为「代码生成」**、发布包内容 | 登记 100%；发布包不含 `LEGAL/` 与第三方数据目录；无外部字体/图片/音频文件 |
 | TC-PERF-01 | NFR-01/05、TF-01 | 压测 | N 房间 × 6 合成客户端 | tick P95 ≤4 ms；单核 ≥8 房间；内存 ≤128 MB/房 |
 | TC-PERF-02 | NFR-02/08、FR-85 | 真机 | 三档机型 × 连续 2 局 | 中端 60fps、低端 ≥30fps；内存 ≤700 MB |
-| TC-UI-01 | FR-40/41/42 | 真机 | 双模切换、多点触控、热区测量 | 无丢失触点；切换不产生位移；热区 ≥44dp |
+| TC-UI-01 | FR-40/41/42 | 真机 | 左键寻路、右键移动/锁定、触摸点触与长按、热区测量 | 键盘不产生位移；无丢失触点；热区 ≥44dp |
+| TC-CBT-01~12 | `GX-CBT-2026-001` §19 | 单元 + 集成 + 门禁 | 操作/寻路/伤害/状态/商店/野怪/目标/塔/表现层 | 已通过 11 项，`TC-CBT-05`（普攻前后摇）待实现；细则见规格 §19.1 |
+| TC-GP-01 | `GX-CBT-2026-001` §22 | 集成 | ECS 系统链真实驱动护盾→阵亡→购买→占领→重生 | ✅ 通过；`gx-e2e/tests/gameplay.rs` |
+| TC-NAV-01~09 | `GX-CBT-2026-001` §24 | 单元 + 集成 + 抓包 | 动态障碍 / 重算节流 / 服务端速度与碰撞校验 | ⛔ M2 待办，仅规格已定义 |
 | TC-ACCOUNT-01 | FR-71/72、CR-02/03 | 集成 + 人工 | 未实名、时段外、超额付费 | 全部被拒；合规验收签字 |
 
 ### 5.3 TF → TC 映射（回填 `GX-TF-2026-001` 的验证结果）
@@ -270,7 +279,7 @@ pub fn verify_replay(path: &Path) -> Result<ReplayDiff, ReplayError>;
 **发布包检查清单**（DN-29/30/32、CR-01）：
 - `--no-default-features`，确认 `dev-tools`、`offline-dev` 未启用；
 - 包体不包含 `LEGAL/`、第三方数据目录、遥测样本、`docs/` 合规留档；
-- 字体/音频许可齐全且登记；
+- 表现层全部代码生成、零外部资源路径；音频若引入须登记许可；
 - 窗口标题、包名、二进制名、描述均为 GX-01 代号或最终产品名；
 - 禁词扫描对**发布包**再跑一次（不只是源码）。
 

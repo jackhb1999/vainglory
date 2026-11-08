@@ -1,0 +1,53 @@
+name: gx-01-ci
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # DEV-28 / CI 阶段 1：格式
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      # DEV-28 / CI 阶段 2：静态检查
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # DEV-26 / CI 阶段 3：禁词与资产门禁（TC-COMPLIANCE-01/02）
+      - name: asset-and-term-gate
+        run: cargo test -p gx-e2e --test compliance -- --nocapture
+
+      # DEV-02 / CI 阶段 4：配置校验（TC-CFG-01）
+      - name: config-validate
+        run: cargo test -p gx-config -- --nocapture
+
+      # DEV-27 / CI 阶段 5：全量测试（含 TC-NET-01~04、TC-PRED-01、端到端握手与重连）
+      - name: test
+        run: cargo test --workspace --locked -- --nocapture
+
+      # DEV-28 / CI 阶段 8：可复现构建
+      - name: build-release
+        run: cargo build --release --locked --workspace
+
+      # 发布构建不得启用调试 feature（DN-40 / DEV-28 发布包检查清单）
+      - name: release-feature-gate
+        shell: pwsh
+        run: |
+          $tree = cargo tree -e features -p client --no-default-features
+          if ($tree | Select-String -SimpleMatch "offline-dev" -Quiet) {
+            throw "offline-dev must not be enabled in release builds"
+          }

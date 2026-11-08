@@ -1,15 +1,15 @@
 //! 验证服务端 FixedUpdate 是否真的在跑（移动/攻击逻辑都挂在 FixedUpdate 上）。
 //! 若 ServerTick 一直为 0，说明 FixedUpdate 没执行，英雄永远不会移动/攻击。
 
-use bevy::prelude::*;
 use bevy::asset::Assets;
 use bevy::pbr::StandardMaterial;
+use bevy::prelude::*;
 use bevy::render::mesh::Mesh;
 use game_core::components::*;
-use server::networking::{NetworkingPlugin, ServerPort};
-use server::simulation::{SimulationPlugin, ServerTick};
-use server::spawn::SpawnPlugin;
 use server::ServerPlugin;
+use server::networking::{NetworkingPlugin, ServerPort};
+use server::simulation::{ServerTick, SimulationPlugin};
+use server::spawn::SpawnPlugin;
 use std::time::Duration;
 
 fn build_server() -> App {

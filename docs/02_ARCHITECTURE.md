@@ -58,7 +58,9 @@
 > **唯一例外**：`docs/` 下的合规留档文档（如上游 `VG-FS-2026-001` 与本文 §2.2 本身）为进行可区分性审查与法律举证而引用这些词，须集中在受控目录，并被 CI 扫描器显式排除。规则层映射表（"哪条规则借鉴自哪里"）属**法务留档**，不得进入游戏包体、不得进入产品文案。
 
 ### 2.3 门禁（ADR-10）
-`gx-tools lint-assets` 在 CI 中执行：禁词扫描、资产来源登记校验、字体/音频许可校验、配置表引用完整性校验。任一失败即阻断合并。对应 `TF-11`、`CR-01`。
+`gx-tools lint-assets` 在 CI 中执行：禁词扫描、资产来源登记校验、**外部资源路径扫描**（禁止运行时读取字体/图片/音频文件）、配置表引用完整性校验。任一失败即阻断合并。对应 `TF-11`、`CR-01`、`GX-CBT-2026-001` §16.3。
+
+> **v1.2 表现层约束（本轮需求变更）**：表现层**全部由代码生成**，采用 Minecraft 式体素风格（轴对齐立方体 + 低分辨率像素纹理 + `Nearest` 采样），不依赖任何外部资源；UI 使用引擎内置字形的 ASCII 文案，禁止加载操作系统字体。完整约束 PRES-1~9 见 `GX-CBT-2026-001` §16。此约束取代 §2.1 中关于"原创 3D 模型 / 商用授权字体"的表述。
 
 ---
 
@@ -172,15 +174,21 @@ flowchart TB
 
 ### 4.3 迁移顺序（禁止一次性重写）
 
-| 阶段 | 动作 | 不破坏的约束 |
-|---|---|---|
-| M1-a | 根 `Cargo.toml` 更名（去 `Vainglory` 描述）、补 `Cargo.lock`、CI；清理死依赖与临时日志 | 全部现有测试通过 |
-| M1-b | 从 `game-core` 抽出 `gx-net`（`net.rs` 协议 + bitcode），删除其中对 `bevy::math` 的 `From` 实现，改由适配层转换 | `game-core` 通过 re-export 保持 API 兼容 |
-| M1-c | 解除 `client → server` 反向依赖；把 `interpolation` 改为 `pub mod` 并**注册** `InterpolationPlugin` | E2E 移动测试通过 |
-| M1-d | `gx-config` 落地，先迁移"技能数值/英雄基础值/塔血量"三类硬编码 | 配置校验器在 CI 跑通 |
-| M2 | `game-core` → `gx-sim`，剥离 `bevy_render` 相关类型；服务端与预测共用 | 现有 `simulation.rs` 系统链语义不变 |
-| M3 | `gx-platform` / `gx-gateway` / `gx-matchmaker` 服务化，战斗服接入令牌 | 单机调试模式仍可一键启动（离线可用） |
+> **v1.1 修订（经澄清 Q-02 授权）**：本表原与 `GX-DEV-2026-001` §2.2 / `GX-PRD-2026-001` §9 的阶段定义冲突，现统一以后两者为排期基准。
 
+| 阶段 | 动作 | 不破坏的约束 / 闸门 |
+|---|---|---|
+| M0 | 合规与技术基线：对外二进制名与描述清理、第三方数据隔离到 `LEGAL/`、`rust-toolchain.toml`、CI 骨架、禁词与资产门禁、临时日志清理、法律意见归档 | **G0**：禁词 0 命中、资产登记 100%、可复现构建 |
+| M1-a | 工程清理：死依赖、解除 `client → server`、`interpolation` 改 `pub mod` 并注册 `InterpolationPlugin`、`ClientPlugin` 处置、README 对齐 | 全测试通过；`-D warnings` 清零 |
+| M1-b | 协议抽离：`net.rs` → `gx-net`、协议字段演进与双版本协商；`Transport` 抽象与接入认证 | `game-core` re-export 保持 API 兼容；E2E 不回归 |
+| M1-c | 配置落地：`gx-config` + `gx-proto-content`，先迁技能/英雄/哨塔三类硬编码；校验器接入 CI | `TC-CFG-01` 通过 |
+| M1-d | 网络加固：服务端视野裁剪、delta + 通道分级、预测/插值闭环、真实 RTT、状态恢复式重连 | **G1**：`TC-NET-01/02/03/04`、`TC-PRED-01` 通过 |
+| M2 | 垂直切片（玩法闭环）与 `game-core → gx-sim` 逻辑共用；**TF-01 容量压测（自 G1 移入）**与 `cost_per_match` 实测 | **G2** |
+| M3 | 上线就绪：账号实名支付、匹配编排、运营后台、反作弊、局外 UI、机型适配、CI/CD 完整化 | **G3** |
+| M4 | 灰度与单位经济复核 | **G4** |
+
+> **M0+M1 命名约定（经澄清 Q-11）**：现有 4 个 crate 名（`game-core` / `client` / `server` / `matchmaking`）**保持不变**，仅修改对外二进制名与 `description`；本阶段新增的组件 crate 采用 `gx-*` 命名。完整 crate 重命名推迟至 `game-core → gx-sim` 迁移阶段。
+>
 > **迁移红线**：任何阶段都必须保持 `cargo test --workspace` 通过，且保留一个无需外部服务的 `--features offline-dev` 单机调试启动路径（现状"1 人即开局"是有价值的调试能力，应保留为显式 feature，而不是删除）。
 
 ---
@@ -228,6 +236,8 @@ flowchart TB
 3. 视野裁剪必须在编码之前；
 4. 生成/销毁实体后必须 `ApplyDeferred`，再进入下一阶段（见 DN-17）；
 5. `ServerTick` 递增是全链第一个动作。
+
+> **分阶段落地说明（v1.1，消除 §4.3 原排期与 ADR-05 的自相矛盾）**：F 阶段的 `visibility_system` 属于 **M1-d**，先于 M2 的任何玩法内容开发（ADR-05）；B/E 阶段的新增玩法系统属于 **M2**；G 阶段改为读取 `ConfigSet` 属于 **M1-c**。M1 结束时系统链仅包含"输入校验 / 视野 / 编码 / 回放记录"等加固项，玩法空壳保持 M2 再实现，避免超出本次交付终点。
 
 ### 6.2 客户端调度
 
@@ -312,6 +322,24 @@ flowchart TB
 
 ### 8.4 版本协商
 `PROTOCOL_VERSION`（现状 =1）与 `config_hash` 双版本号在握手时交换；不兼容时返回明确 `Reject`，不得静默降级或崩溃（TF-10）。
+
+### 8.5 一期最小可见性规则集（经澄清 Q-04 授权自定义）
+
+> 本规则集是对 `FR-60` / `CR-05` / `TC-NET-03` 的**规则细化**，用于消除"简化可见性"与"抓包零泄漏"之间的边界歧义。属一期范围；完整射线级 LoS 仍按 `GX-PRD-2026-001` §3.3 留到二期。
+
+| 编号 | 规则 |
+|---|---|
+| VIS-1 | 服务端为**每个玩家**独立计算 `VisibilitySet`，裁剪在所有序列化之前执行（§6.1 顺序不变量 3） |
+| VIS-2 | 己方阵营实体（英雄 / 战偶 / 哨塔 / 源核 / 归航台）**始终可见** |
+| VIS-3 | 敌方实体可见条件：与任一己方「可见源」的距离 ≤ `vision_radius`（配置值），且不在遮蔽区内；否则一律从快照中剔除 |
+| VIS-4 | 可见源 = 己方存活英雄 + 己方存活哨塔 + 己方战偶（是否在场由配置开关控制）；一期不做遮挡射线，仅做半径 + 遮蔽区判定 |
+| VIS-5 | 遮蔽区（草丛 / 障碍）内的敌方实体，仅在距离 ≤ `brush_reveal_radius`（< `vision_radius`）时可见 |
+| VIS-6 | 中立单位与占领目标：仅当其处于 VIS-3 判定的可见范围内时随快照下发；目标**归属状态**（owner / progress）属全局游戏状态，通过 `ObjectiveCaptured` 事件全局广播，但事件**不得携带任何敌方实体字段** |
+| VIS-7 | `GameEvent` 中涉及实体 `NetId` 的变体（伤害 / 阵亡 / 施法 / 生成）必须按接收方 `VisibilitySet` 过滤后再下发；不可见实体的事件不得发出 |
+| VIS-8 | 小地图与统计数据由快照派生，不设独立数据源；因此自动继承 VIS-3~7 的裁剪结果 |
+| VIS-9 | 观战（`FR-16`，P2）、"已探明区域"记忆与真实 LoS 遮挡为二期；一期无全局视野，`TC-NET-03` 的通过判据为"包体中不出现任何 VIS-3 判定为不可见的敌方实体字段（含事件附带数据、小地图、统计）" |
+
+`vision_radius` / `brush_reveal_radius` 与遮蔽区几何来自 `gx-proto-content::map`，M1 阶段用占位值（外部依赖：需平衡验证，见 `GX-PRD-2026-001` §11）。
 
 ---
 
@@ -398,7 +426,7 @@ flowchart TB
 | DN-03 | `ctx_mut()` 必须容错 | 已改为 `let Ok(ctx) = ... else { return; }` | 禁止 `.expect("no egui context")`；上下文未就绪时静默跳过该帧 |
 | DN-04 | 调试 UI 与产品 UI 分离 | `ui.rs` 的 HUD/小地图/技能栏/商店/调试面板均为 egui | egui 仅保留为**开发工具**（`#[cfg(feature="dev-tools")]`）；产品 UI 用 Bevy UI，发布构建不编译 egui 面板（ADR-09） |
 | DN-05 | 主摄像机必须带显式渲染图 | 现状 `Camera3d + Camera + CameraRenderGraph::new(Core3d)` | 任何新增相机都必须明确 `CameraRenderGraph` 或 `Camera2d/Camera3d`；否则 bevy_render 告警且 UI 可能无渲染目标 |
-| DN-06 | 中文字体加载要有降级 | `setup_cjk_font` 从 `C:/Windows/Fonts/` 尝试 5 个文件，仅 Windows 可用 | 改为随包携带**已获商用授权**的字体；加载失败时回退到内置字体并保证不崩溃、不出现空白文本（DN-32） |
+| DN-06 | **禁止运行时加载操作系统字体** | 原 `setup_cjk_font` 从 `C:/Windows/Fonts/` 尝试 5 个文件，仅 Windows 可用且许可不明 | **v1.2 修订**：删除该系统，UI 文案改用引擎内置字形的 ASCII 字符集；表现层全部代码生成（`GX-CBT-2026-001` §16 PRES-3）。`TC-CBT-12` 扫描断言源码中无字体路径字面量 |
 
 ### 14.2 网络与同步
 
@@ -444,7 +472,7 @@ flowchart TB
 | DN-29 | 第三方数据不得进入发布包 | `dictionaries/*.json`、`assets/resources/**` 遥测样本 ≈3.7 MB，标注 "Copyright 2017 Super Evil Megacorp"，但代码未读取 | 隔离到 `LEGAL/` 或移出仓库；发布流水线显式排除；**禁止据此生成商品化数值表** |
 | DN-30 | 命名与描述清理 | `Cargo.toml` 的 `"Vainglory Rust reimplementation"`、窗口标题 `"Vainglory - Client"`、二进制名 `vainglory-*`、README 标题 | 全部改为 GX-01 代号；git 历史中的对外描述一并评估 |
 | DN-31 | 独立创作证据链 | 仓库无资产来源登记 | 每个美术/音频/配置资产登记作者、来源、日期；设计稿与提交历史可追溯；CI 校验（TF-11） |
-| DN-32 | 字体与音频许可 | `setup_cjk_font` 直接读 Windows 系统字体 | 随包字体须有商用授权并登记；禁止打包系统字体 |
+| DN-32 | 发布包零第三方表现资产 | 原 `setup_cjk_font` 直接读 Windows 系统字体 | **v1.2 修订**：几何/纹理/材质/图标/字形全部由代码生成，无字体与音频资产可登记；第三方内容仅留在 `LEGAL/` 且不得进入发布包（`GX-CBT-2026-001` §16.3） |
 | DN-33 | 规则层映射表不外泄 | — | 映射表仅存法务留档目录，被 CI 扫描器排除；不进入包体、日志、市场材料 |
 
 ### 14.6 工程与测试
@@ -453,7 +481,7 @@ flowchart TB
 |---|---|---|---|
 | DN-34 | 解除 `client → server` 反向依赖 | `client/Cargo.toml` 有 `server = { path = "../server" }` | 共享内容下沉到 `gx-net`/`gx-sim`；客户端不得依赖服务端 crate |
 | DN-35 | 死代码与未使用依赖 | `ClientPlugin` 未被 `main.rs` 使用；`interpolation` 为私有模块；`bevy_renet2`/`glam`/`redis` 零引用 | 要么注册并测试，要么删除；CI 开 `-D warnings` 前先清零 |
-| DN-36 | 提交 `Cargo.lock` | 仓库无 `Cargo.lock` | 应用类 crate 必须提交锁文件以保证可复现构建 |
+| DN-36 | 提交 `Cargo.lock` | **v1.1 勘误**：盘点时误记为"仓库无锁文件"；实测 `git ls-files` 确认 `Cargo.lock` 已被跟踪 | 保持锁文件纳入版本控制；CI 用 `--locked` 构建，禁止 `cargo update` |
 | DN-37 | 工具链锁定 | edition 2024 需 Rust ≥1.85 | 用 `rust-toolchain.toml` 固定版本；CI 与本地一致 |
 | DN-38 | 文档与代码一致性 | README 第一节称技能已实现、第三节仍列未完成；称"满 6 人"但代码 1 人即开局；记录一个未解决掉血 Bug | 每次合并同步更新 README；已知 Bug 要么修复要么登记为 issue 并标注影响 |
 | DN-39 | 测试要覆盖调度与协议 | 现有约 15 个测试，含握手/移动/伤害 E2E | 新增：视野裁剪抓包、delta 收敛、配置校验、回放一致性、协议兼容（对应 `TC-*`） |
@@ -482,7 +510,7 @@ flowchart TB
 
 - ID 前缀定义见 `GX-TF-2026-001` §0。
 - 术语表见本文 §2.1；禁用词表见 §2.2。
-- 需求编号定义见 `GX-PRD-2026-001` §4；开发任务编号见 `GX-DEV-2026-001` §3。
+- 需求编号定义见 `GX-PRD-2026-001` §4；开发任务编号见 `GX-DEV-2026-001` §4。
 
 ## 附录 B：现状 → 目标符号映射（供迁移使用）
 

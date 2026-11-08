@@ -1,22 +1,34 @@
-//! 服务端网络模块
+//! 服务端网络模块（M1-b / M1-d）
 //!
-//! 使用 renet2 作为权威服务器：监听 0.0.0.0:5000，接收客户端连接、
-//! 分配 NetId、生成英雄实体，并将世界快照与游戏事件下发给所有客户端。
+//! - 会话认证与双版本协商（`FR-57` / `FR-62`）
+//! - 服务端权威视野裁剪，序列化前执行（`FR-60` / `CR-05` / VIS-1~9）
+//! - 增量快照 + 通道分级（`FR-52` / `FR-53` / `DEV-06`）
+//! - 状态恢复式重连（`FR-55` / `DEV-08`）
+//! - 输入序号/校验和校验与真实 RTT 回显（`FR-56` / `FR-61`）
+//!
+//! 传输层仍使用 netcode 的 `Unsecure` 握手；应用层令牌校验在此实现。
+//! connect token / DTLS 属 M3 外部依赖（见 `GX-PRD-2026-001` §11.1）。
 
 use bevy::prelude::*;
-use std::collections::HashMap;
+use game_core::components::*;
+use game_core::gameplay::clock::{MatchClock, MatchMode, MatchPhase};
+use game_core::gameplay::{combat, registry, shop};
+use game_core::net::{
+    BASELINE_INTERVAL_TICKS, ClientMessage, ConfigHash, EntityDelta, EntitySnapshot, EntityType,
+    EventEnvelope, GameEvent, InputCmd, PROTOCOL_VERSION, Quatf, RejectReason,
+    SNAPSHOT_INTERVAL_TICKS, ServerMessage, SessionToken, Snapshot, SnapshotHeader, Vec3f,
+    WorldSnapshot, negotiate,
+};
+use game_core::visibility::{compute_visibility, event_visible};
+use gx_config::ConfigSet;
+use gx_net::VisibilityPolicy;
 use renet2::{ClientId, ConnectionConfig, DefaultChannel, RenetServer};
 use renet2_netcode::{
     NativeSocket, NetcodeServerTransport, ServerAuthentication, ServerSetupConfig,
 };
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use game_core::net::{
-    ClientMessage, EntitySnapshot, EntityType, GameEvent, InputCmd, PROTOCOL_VERSION,
-    ServerMessage, Vec3f, Quatf, WorldSnapshot,
-};
-use game_core::components::*;
-use bitcode;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// 待处理的客户端输入（键为英雄的 net id）
 #[derive(Resource, Default)]
@@ -24,7 +36,7 @@ pub struct PendingInputs {
     pub inputs: HashMap<u64, InputCmd>,
 }
 
-/// renet 连接 id -> 该玩家在服务端分配的 (NetId, Team)
+/// renet 连接 id -> 该玩家在服务端分配的 (NetId, Team)。**仅已认证会话**才有条目。
 #[derive(Resource, Default)]
 pub struct ClientNetIds(pub HashMap<ClientId, (NetId, Team)>);
 
@@ -41,7 +53,21 @@ pub struct ServerPort(pub u16);
 
 impl Default for ServerPort {
     fn default() -> Self {
-        ServerPort(DEFAULT_SERVER_PORT)
+        let port = std::env::var("GX_SERVER_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_SERVER_PORT);
+        ServerPort(port)
+    }
+}
+
+/// 对外公布的地址（DN-08：不再硬编码）
+#[derive(Resource)]
+pub struct ServerHost(pub String);
+
+impl Default for ServerHost {
+    fn default() -> Self {
+        ServerHost(std::env::var("GX_SERVER_HOST").unwrap_or_else(|_| "127.0.0.1".into()))
     }
 }
 
@@ -49,12 +75,11 @@ impl Default for ServerPort {
 #[derive(Resource, Default)]
 pub struct MatchStarted(pub bool);
 
-/// 服务端累积的待广播游戏事件（如 AbilityCast），每个广播周期清空
+/// 服务端累积的待广播游戏事件，每个广播周期清空
 #[derive(Resource, Default)]
 pub struct ServerEvents(pub Vec<GameEvent>);
 
-/// 训练假人的生成信息（net id / 阵营 / 名称 / 位置），用于把假人的 HeroSpawn 事件
-/// 下发给每个连接（含后续加入）的客户端，使其能渲染假人。
+/// 训练假人的生成信息，用于把假人的 HeroSpawn 事件下发给每个（含后续加入）客户端
 #[derive(Resource, Default)]
 pub struct DummyRegistry(pub Vec<GameEvent>);
 
@@ -72,13 +97,42 @@ pub struct RenetServerResource(pub RenetServer);
 #[derive(Resource)]
 pub struct ServerTransportResource(pub NetcodeServerTransport);
 
-/// 用真实墙钟驱动 netcode 时钟。
-///
-/// `ScheduleRunnerPlugin` 的默认忙循环（无延迟）会让 `Time::delta()` 近似为 0，
-/// 若每帧用固定 1/60 的 delta 推进 `NetcodeServerTransport`，其 `current_time`
-/// 会以远超真实时间的速度飞奔，导致客户端（以真实时间推进时钟）的连接请求
-/// 时间戳始终落在服务器校验窗口之外而被拒绝。因此这里用 `Instant` 计算真实
-/// 流逝时间喂给 transport，使其 `current_time` 与客户端保持同步。
+/// 本进程绑定的 ConfigSet。一局内不变（`DN-25`）。
+#[derive(Resource)]
+pub struct ServerConfig(pub ConfigSet);
+
+/// 会话令牌 -> 身份。断线后保留，供状态恢复式重连。
+#[derive(Resource, Default)]
+pub struct SessionRegistry(pub HashMap<SessionToken, (NetId, Team)>);
+
+/// 连接 -> 会话令牌
+#[derive(Resource, Default)]
+pub struct ClientSessions(pub HashMap<ClientId, SessionToken>);
+
+/// 每个连接的增量快照状态。
+#[derive(Clone, Default)]
+pub struct ClientView {
+    pub last_sent: HashMap<u64, EntityDelta>,
+    pub last_baseline_tick: u64,
+    pub view_seq: u32,
+}
+
+#[derive(Resource, Default)]
+pub struct ClientViews(pub HashMap<ClientId, ClientView>);
+
+/// 每个英雄已接受的最大输入序号（去重 / 迟到丢弃，`FR-61`）
+#[derive(Resource, Default)]
+pub struct InputSeqs(pub HashMap<u64, u32>);
+
+/// 单调递增的关键事件 id（`FR-53`）
+#[derive(Resource, Default)]
+pub struct EventCursor(pub u64);
+
+/// 每个英雄最近一次上行时间戳，用于 RTT 回显（`FR-56`）
+#[derive(Resource, Default)]
+pub struct ClientTimestamps(pub HashMap<u64, u64>);
+
+/// 用真实墙钟驱动 netcode 时钟（避免忙循环下时钟飞奔）。
 #[derive(Resource)]
 pub struct NetcodeClock {
     last: Instant,
@@ -102,16 +156,40 @@ impl Plugin for NetworkingPlugin {
             .init_resource::<MatchStarted>()
             .init_resource::<ServerNetworkState>()
             .init_resource::<ServerPort>()
+            .init_resource::<ServerHost>()
             .init_resource::<NetcodeClock>()
             .init_resource::<ServerEvents>()
             .init_resource::<DummyRegistry>()
+            .init_resource::<SessionRegistry>()
+            .init_resource::<ClientSessions>()
+            .init_resource::<ClientViews>()
+            .init_resource::<InputSeqs>()
+            .init_resource::<EventCursor>()
+            .init_resource::<ClientTimestamps>()
+            .init_resource::<crate::gameplay::SellIntents>()
+            .insert_resource(ServerConfig(
+                ConfigSet::load_default_with_gameplay(
+                    game_core::gameplay::registry::content_digest(),
+                )
+                .expect("placeholder ConfigSet must validate"),
+            ))
             .add_systems(Startup, start_server)
-            .add_systems(Update, (poll_connections, receive_inputs, broadcast_snapshot).chain());
+            .add_systems(
+                Update,
+                (
+                    poll_connections,
+                    handle_session_messages,
+                    receive_inputs,
+                    handle_gameplay_messages,
+                    broadcast_snapshot,
+                )
+                    .chain(),
+            );
     }
 }
 
-/// 启动服务器：创建 UDP socket 并监听配置端口（默认 0.0.0.0:5000）
-pub fn start_server(mut commands: Commands, port: Res<ServerPort>) {
+/// 启动服务器：创建 UDP socket 并监听配置端口
+pub fn start_server(mut commands: Commands, port: Res<ServerPort>, host: Res<ServerHost>) {
     let server_addr: SocketAddr = format!("0.0.0.0:{}", port.0)
         .parse()
         .expect("Invalid server address");
@@ -119,7 +197,7 @@ pub fn start_server(mut commands: Commands, port: Res<ServerPort>) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "无法绑定 {}：{e}。\n端口可能已被另一个服务端实例占用，请先关闭/结束旧的 vainglory-server 进程再启动。",
+                "无法绑定 {}：{e}。\n端口可能已被另一个服务端实例占用，请先关闭/结束旧的 gx-battle 进程再启动。",
                 server_addr
             );
             std::process::exit(1);
@@ -128,199 +206,78 @@ pub fn start_server(mut commands: Commands, port: Res<ServerPort>) {
     let socket = NativeSocket::new(socket).expect("Failed to create native socket");
 
     let current_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let published: SocketAddr = format!("{}:{}", host.0, port.0)
+        .parse()
+        .expect("Invalid published server address");
     let server_config = ServerSetupConfig {
         current_time,
         max_clients: 64,
         protocol_id: PROTOCOL_VERSION as u64,
-        // 连接令牌中公布的地址需与客户端实际连接地址一致（本地回环 127.0.0.1）。
-        // 如需局域网联机，请改为宿主机的实际 IP。
-        socket_addresses: vec![vec![
-            format!("127.0.0.1:{}", port.0)
-                .parse::<SocketAddr>()
-                .unwrap(),
-        ]],
+        socket_addresses: vec![vec![published]],
         authentication: ServerAuthentication::Unsecure,
     };
 
     let transport = NetcodeServerTransport::new(server_config, socket)
         .expect("Failed to create server transport");
-    let server = RenetServer::new(ConnectionConfig::from_shared_channels(DefaultChannel::config()));
+    let server = RenetServer::new(ConnectionConfig::from_shared_channels(
+        DefaultChannel::config(),
+    ));
 
     commands.insert_resource(RenetServerResource(server));
     commands.insert_resource(ServerTransportResource(transport));
     info!("Server listening on {}", server_addr);
 }
 
-/// 处理连接/断开、接受/发送数据包
+fn send_reliable(server: &mut RenetServer, client_id: ClientId, msg: &ServerMessage) {
+    server.send_message(
+        client_id,
+        DefaultChannel::ReliableOrdered,
+        bitcode::encode(msg),
+    );
+}
+
+/// 处理连接层事件；断线时**保留英雄实体与会话令牌**，供重连恢复（`DEV-08`）。
 fn poll_connections(
-    mut commands: Commands,
-    mut server_res: Option<ResMut<RenetServerResource>>,
-    mut transport_res: Option<ResMut<ServerTransportResource>>,
+    server_res: Option<ResMut<RenetServerResource>>,
+    transport_res: Option<ResMut<ServerTransportResource>>,
     mut client_net_ids: ResMut<ClientNetIds>,
-    mut next_net_id: ResMut<NextNetId>,
+    mut client_sessions: ResMut<ClientSessions>,
+    mut views: ResMut<ClientViews>,
     mut net_state: ResMut<ServerNetworkState>,
     mut clock: ResMut<NetcodeClock>,
-    dummy_registry: Res<DummyRegistry>,
-    heroes: Query<(Entity, &NetId, &Team)>,
 ) {
     let (Some(mut server_res), Some(mut transport_res)) = (server_res, transport_res) else {
         return;
     };
 
-    // 用真实墙钟流逝时间推进 netcode，避免使用固定 delta 在忙循环下导致时钟飞奔
     let now = Instant::now();
     let delta = now.duration_since(clock.last);
     clock.last = now;
     server_res.0.update(delta);
     let _ = transport_res.0.update(delta, &mut server_res.0);
 
-    // 当前仍连接在 renet 中的客户端集合：用于新连接检测与过期清理
-    let live = server_res.0.clients_id();
+    let live: HashSet<ClientId> = server_res.0.clients_id().into_iter().collect();
+    let disconnected: Vec<ClientId> = server_res.0.disconnections_id().into_iter().collect();
 
-    // 处理新连接
-    for client_id in &live {
-        let client_id = *client_id;
-        if client_net_ids.0.contains_key(&client_id) {
-            continue;
-        }
-        // 基于已分配的队伍记录来交替分配，避免使用延迟生成的英雄实体（commands 尚未 apply）导致计数滞后
-        let blue_count = client_net_ids
-            .0
-            .values()
-            .filter(|(_, t)| *t == Team::Blue)
-            .count();
-        let red_count = client_net_ids
-            .0
-            .values()
-            .filter(|(_, t)| *t == Team::Red)
-            .count();
-        let team = if blue_count <= red_count {
-            Team::Blue
-        } else {
-            Team::Red
-        };
-
-        let net_id = NetId(next_net_id.0);
-        next_net_id.0 += 1;
-
-        info!("Client {:?} connected -> net id {:?} ({:?})", client_id, net_id, team);
-
-        // 生成服务端权威英雄实体
-        let spawn_pos = match team {
-            Team::Blue => bevy::math::Vec3::new(-15.0, 0.0, 0.0),
-            Team::Red => bevy::math::Vec3::new(15.0, 0.0, 0.0),
-            Team::Neutral => bevy::math::Vec3::ZERO,
-        };
-        let hero_entity = commands.spawn((
-            net_id,
-            team,
-            Transform::from_translation(spawn_pos),
-            Hero {
-                name: "Ringo".to_string(),
-                move_speed: game_core::components::HERO_BASE_MOVE_SPEED,
-                ..default()
-            },
-            TransformSync {
-                position: spawn_pos,
-                ..default()
-            },
-            PlayerInput::default(),
-            HeroAbilities {
-                cooldowns: [0.0; 4],
-                ability_ids: game_core::abilities::default_hero_abilities(),
-            },
-            ServerAuthority,
-            LocalPlayer,
-        )).id();
-        info!("Spawned hero entity {:?} for net {:?}", hero_entity, net_id);
-
-        client_net_ids.0.insert(client_id, (net_id, team));
-
-        let welcome = ServerMessage::Welcome {
-            your_net_id: net_id,
-            assigned_team: team,
-            match_id: 0,
-            server_tick: 0,
-        };
-        server_res
-            .0
-            .send_message(client_id, DefaultChannel::ReliableOrdered, bitcode::encode(&welcome));
-
-        let hero_spawn = ServerMessage::Event(GameEvent::HeroSpawn {
-            net_id,
-            team,
-            hero_name: "Ringo".to_string(),
-            position: Vec3f::from_vec3(spawn_pos),
-        });
-        server_res
-            .0
-            .send_message(client_id, DefaultChannel::ReliableOrdered, bitcode::encode(&hero_spawn));
-
-        // 把已存在的训练假人 HeroSpawn 一并下发给新客户端
-        for dummy_event in &dummy_registry.0 {
-            server_res.0.send_message(
-                client_id,
-                DefaultChannel::ReliableOrdered,
-                bitcode::encode(&ServerMessage::Event(dummy_event.clone())),
-            );
-        }
-    }
-
-    // 处理断开连接
-    for client_id in server_res.0.disconnections_id() {
-        if let Some((net_id, _team)) = client_net_ids.0.remove(&client_id) {
-            for (entity, e_net_id, _) in heroes.iter() {
-                if *e_net_id == net_id {
-                    commands.entity(entity).despawn();
-                    break;
-                }
-            }
-            // 通知其余客户端移除该英雄实体，否则其客户端会残留僵尸实体
-            for other in server_res.0.clients_id() {
-                if other == client_id {
-                    continue;
-                }
-                let _ = server_res.0.send_message(
-                    other,
-                    DefaultChannel::ReliableOrdered,
-                    bitcode::encode(&ServerMessage::Event(GameEvent::HeroDespawn { net_id })),
-                );
-            }
-            info!("Client {:?} (net {:?}) disconnected", client_id, net_id);
-        }
-    }
-
-    // 清理 stale 客户端：若某 client_id 仍在我们的映射里、却已不在 renet 连接集合中，
-    // 说明 renet 已丢弃该连接而 disconnections_id() 未上报（常见于超时 / 快速重连），
-    // 必须手动移除——否则后续 send_message 会持续刷 “invalid client” 错误，且英雄实体残留。
-    let live_set: std::collections::HashSet<ClientId> = live.iter().copied().collect();
     let stale: Vec<ClientId> = client_net_ids
         .0
         .keys()
         .copied()
-        .filter(|id| !live_set.contains(id))
+        .filter(|id| !live.contains(id))
         .collect();
-    for client_id in stale {
-        if let Some((net_id, _)) = client_net_ids.0.remove(&client_id) {
-            for (entity, e_net_id, _) in heroes.iter() {
-                if *e_net_id == net_id {
-                    commands.entity(entity).despawn();
-                    break;
-                }
-            }
-            // 通知其余仍在连接的客户端移除该英雄实体
-            for other in client_net_ids.0.keys() {
-                let _ = server_res.0.send_message(
-                    *other,
-                    DefaultChannel::ReliableOrdered,
-                    bitcode::encode(&ServerMessage::Event(GameEvent::HeroDespawn { net_id })),
-                );
-            }
-            info!("Cleaned up stale client {:?} (net {:?})", client_id, net_id);
+    for client_id in disconnected.iter().copied().chain(stale) {
+        if client_net_ids.0.remove(&client_id).is_some() {
+            // 不 despawn：恢复重连时复用原 NetId / 英雄实体
+            client_sessions.0.remove(&client_id);
+            views.0.remove(&client_id);
+            info!(
+                "Client {:?} disconnected; session kept for resume",
+                client_id
+            );
         }
     }
 
-    let _ = transport_res.0.send_packets(&mut server_res.0);
+    transport_res.0.send_packets(&mut server_res.0);
 
     net_state.connected_players = client_net_ids.0.len();
     net_state.blue_count = client_net_ids
@@ -335,49 +292,228 @@ fn poll_connections(
         .count();
 }
 
-/// 接收客户端输入，按 client_id -> net id 映射后写入 PendingInputs
-fn receive_inputs(
-    mut server_res: Option<ResMut<RenetServerResource>>,
-    mut pending: ResMut<PendingInputs>,
-    client_net_ids: Res<ClientNetIds>,
-) {
-    let Some(mut server) = server_res else {
+/// 会话建立 / 恢复：校验协议版本与内容 hash，无令牌连接不分配身份（`FR-62`）。
+/// 大厅模式选择的唯一写入口。只在 Warmup（开局前）接受，局中改模式会破坏
+/// 人数门槛与 AI 生成，因此一律忽略；未知 `mode` 由 `from_code` 回退 PVE。
+fn apply_match_mode(clock: &mut Option<ResMut<MatchClock>>, mode: u8) {
+    let Some(c) = clock.as_mut() else {
         return;
     };
+    if c.phase != MatchPhase::Warmup {
+        return;
+    }
+    let next = MatchMode::from_code(mode);
+    if c.mode != next {
+        c.mode = next;
+        info!("[lobby] match mode -> {next:?}");
+    }
+}
+
+fn handle_session_messages(
+    mut commands: Commands,
+    server_res: Option<ResMut<RenetServerResource>>,
+    mut clock: Option<ResMut<MatchClock>>,
+    config: Res<ServerConfig>,
+    mut client_net_ids: ResMut<ClientNetIds>,
+    mut next_net_id: ResMut<NextNetId>,
+    mut sessions: ResMut<SessionRegistry>,
+    mut client_sessions: ResMut<ClientSessions>,
+    mut views: ResMut<ClientViews>,
+    dummy_registry: Res<DummyRegistry>,
+    heroes: Query<(&NetId, &Team, &Hero, &TransformSync, &HeroAbilities)>,
+) {
+    let Some(mut server) = server_res else { return };
+    let expected_hash: ConfigHash = config.0.content_hash;
 
     for client_id in server.0.clients_id() {
-        let net_id = match client_net_ids.0.get(&client_id) {
-            Some(id) => *id,
-            None => continue,
-        };
-        while let Some(bytes) = server.0.receive_message(client_id, DefaultChannel::Unreliable) {
-            if let Ok(ClientMessage::Input(cmd)) = bitcode::decode::<ClientMessage>(bytes.as_ref()) {
-                pending.inputs.insert(net_id.0 .0, cmd);
+        if client_net_ids.0.contains_key(&client_id) {
+            continue;
+        }
+        let mut messages = Vec::new();
+        while let Some(bytes) = server
+            .0
+            .receive_message(client_id, DefaultChannel::ReliableOrdered)
+        {
+            if let Ok(msg) = bitcode::decode::<ClientMessage>(bytes.as_ref()) {
+                messages.push(msg);
+            }
+        }
+        for msg in messages {
+            match msg {
+                // 与 Hello 同批抵达的模式选择：会话系统会 drain 掉全部 ReliableOrdered
+                // 消息，未认证客户端的 SelectMode 必须在这里处理，否则会被 `_ => {}` 吞掉。
+                ClientMessage::SelectMode { mode } => apply_match_mode(&mut clock, mode),
+                ClientMessage::Hello(session) => {
+                    if let Err(reason) = negotiate(&session.hello, expected_hash) {
+                        send_reliable(&mut server.0, client_id, &ServerMessage::Reject { reason });
+                        continue;
+                    }
+                    let token = session.token;
+                    if let Some(&identity) = sessions.0.get(&token) {
+                        // 重复 Hello：恢复已有身份，不生成新英雄
+                        resume_identity(
+                            &mut server.0,
+                            client_id,
+                            token,
+                            identity,
+                            &mut client_net_ids,
+                            &mut client_sessions,
+                            &mut views,
+                            &heroes,
+                            &config,
+                            &dummy_registry,
+                        );
+                        continue;
+                    }
+                    let blue_count = sessions
+                        .0
+                        .values()
+                        .filter(|(_, t)| *t == Team::Blue)
+                        .count();
+                    let red_count = sessions.0.values().filter(|(_, t)| *t == Team::Red).count();
+                    let team = if blue_count <= red_count {
+                        Team::Blue
+                    } else {
+                        Team::Red
+                    };
+                    let net_id = NetId(next_net_id.0);
+                    next_net_id.0 += 1;
+                    sessions.0.insert(token, (net_id, team));
+                    client_net_ids.0.insert(client_id, (net_id, team));
+                    client_sessions.0.insert(client_id, token);
+                    views.0.remove(&client_id);
+
+                    // 从对应阵营的基地出生，并略微错开避免同队英雄叠在一起
+                    let spawn_pos = match team {
+                        Team::Blue => {
+                            game_core::map::BLUE_BASE + bevy::math::Vec3::new(4.0, 0.0, 4.0)
+                        }
+                        Team::Red => {
+                            game_core::map::RED_BASE + bevy::math::Vec3::new(-4.0, 0.0, -4.0)
+                        }
+                        Team::Neutral => bevy::math::Vec3::ZERO,
+                    };
+                    commands.spawn((
+                        net_id,
+                        team,
+                        Transform::from_translation(spawn_pos),
+                        Hero {
+                            name: "Ashwarden".to_string(),
+                            move_speed: HERO_BASE_MOVE_SPEED,
+                            ..default()
+                        },
+                        TransformSync {
+                            position: spawn_pos,
+                            ..default()
+                        },
+                        PlayerInput::default(),
+                        HeroAbilities {
+                            cooldowns: [0.0; 4],
+                            ability_ids: game_core::abilities::default_hero_abilities(),
+                        },
+                        ServerAuthority,
+                        Collider { radius: 1.3 },
+                        LocalPlayer,
+                    ));
+
+                    send_reliable(
+                        &mut server.0,
+                        client_id,
+                        &ServerMessage::Welcome {
+                            your_net_id: net_id,
+                            assigned_team: team,
+                            match_id: 0,
+                            server_tick: 0,
+                            session_token: token,
+                        },
+                    );
+                    offer_config(&mut server.0, client_id, &config);
+                    send_reliable(
+                        &mut server.0,
+                        client_id,
+                        &ServerMessage::Event(GameEvent::HeroSpawn {
+                            net_id,
+                            team,
+                            hero_name: "Ashwarden".to_string(),
+                            position: Vec3f::from_vec3(spawn_pos),
+                            // 同一阵营内也按 net_id 分配不同外观，避免只能靠血条辨认
+                            skin: match team {
+                                Team::Blue => (net_id.0 % 6) as u8,
+                                Team::Red => 2 + (net_id.0 % 4) as u8,
+                                Team::Neutral => 9,
+                            },
+                        }),
+                    );
+                    for dummy_event in &dummy_registry.0 {
+                        send_reliable(
+                            &mut server.0,
+                            client_id,
+                            &ServerMessage::Event(dummy_event.clone()),
+                        );
+                    }
+                    info!(
+                        "Session established for {:?} -> net {:?} ({:?})",
+                        client_id, net_id, team
+                    );
+                }
+                ClientMessage::ReconnectRequest { token, hello } => {
+                    if let Err(reason) = negotiate(&hello, expected_hash) {
+                        send_reliable(&mut server.0, client_id, &ServerMessage::Reject { reason });
+                        continue;
+                    }
+                    let Some(&identity) = sessions.0.get(&token) else {
+                        send_reliable(
+                            &mut server.0,
+                            client_id,
+                            &ServerMessage::Reject {
+                                reason: RejectReason::InvalidSessionToken,
+                            },
+                        );
+                        continue;
+                    };
+                    resume_identity(
+                        &mut server.0,
+                        client_id,
+                        token,
+                        identity,
+                        &mut client_net_ids,
+                        &mut client_sessions,
+                        &mut views,
+                        &heroes,
+                        &config,
+                        &dummy_registry,
+                    );
+                }
+                _ => {}
             }
         }
     }
 }
 
-/// 收集英雄状态并广播世界快照；比赛开始时下发一次 MatchStart
-fn broadcast_snapshot(
-    mut server_res: Option<ResMut<RenetServerResource>>,
-    mut transport_res: Option<ResMut<ServerTransportResource>>,
-    heroes: Query<(&NetId, &Team, &Hero, &TransformSync, &HeroAbilities)>,
-    projectiles: Query<(&NetId, &Team, &TransformSync, &Projectile)>,
-    mut server_events: ResMut<ServerEvents>,
-    tick: Res<crate::simulation::ServerTick>,
-    mut match_started: ResMut<MatchStarted>,
+#[allow(clippy::too_many_arguments)]
+fn resume_identity(
+    server: &mut RenetServer,
+    client_id: ClientId,
+    token: SessionToken,
+    identity: (NetId, Team),
+    client_net_ids: &mut ClientNetIds,
+    client_sessions: &mut ClientSessions,
+    views: &mut ClientViews,
+    heroes: &Query<(&NetId, &Team, &Hero, &TransformSync, &HeroAbilities)>,
+    config: &ServerConfig,
+    dummy_registry: &DummyRegistry,
 ) {
-    let (Some(mut server), Some(mut transport)) = (server_res, transport_res) else {
-        return;
-    };
+    let (net_id, team) = identity;
+    client_net_ids.0.insert(client_id, identity);
+    client_sessions.0.insert(client_id, token);
+    views.0.remove(&client_id);
 
-    let mut entities: Vec<EntitySnapshot> = heroes
+    let entities: Vec<EntitySnapshot> = heroes
         .iter()
-        .map(|(net_id, team, hero, ts, abilities)| EntitySnapshot {
-            net_id: *net_id,
+        .map(|(id, t, hero, ts, abilities)| EntitySnapshot {
+            net_id: *id,
             entity_type: EntityType::Hero,
-            team: *team,
+            team: *t,
             position: Vec3f::from_vec3(ts.position),
             rotation: Quatf::new(ts.rotation.x, ts.rotation.y, ts.rotation.z, ts.rotation.w),
             velocity: Vec3f::from_vec3(ts.velocity),
@@ -388,20 +524,216 @@ fn broadcast_snapshot(
             level: hero.level,
             gold: hero.gold,
             ability_cooldowns: abilities.cooldowns,
+            status_mask: 0,
+            shield: 0.0,
         })
         .collect();
 
-    // [临时诊断] 仅在英雄受到伤害（血量低于上限）时打印，确认服务端确实把扣血后的血量下发了
-    for es in &entities {
-        if es.health < es.max_health - 0.5 {
-            info!(
-                "[SNAP] net={:?} health={:.1}/{:.1}",
-                es.net_id, es.health, es.max_health
-            );
+    send_reliable(
+        server,
+        client_id,
+        &ServerMessage::SessionResume {
+            net_id,
+            team,
+            snapshot: WorldSnapshot {
+                tick: 0,
+                server_time: 0.0,
+                entities,
+                events: Vec::new(),
+            },
+        },
+    );
+    offer_config(server, client_id, config);
+    for dummy_event in &dummy_registry.0 {
+        send_reliable(
+            server,
+            client_id,
+            &ServerMessage::Event(dummy_event.clone()),
+        );
+    }
+    info!("Session resumed for {:?} -> net {:?}", client_id, net_id);
+}
+
+fn offer_config(server: &mut RenetServer, client_id: ClientId, config: &ServerConfig) {
+    send_reliable(
+        server,
+        client_id,
+        &ServerMessage::ConfigSetOffer {
+            version: config.0.version.clone(),
+            config_hash: config.0.content_hash,
+        },
+    );
+}
+
+/// 接收客户端输入：仅已认证会话；校验序号、校验和与内容 hash（`FR-61` / `FR-57`）。
+fn receive_inputs(
+    server_res: Option<ResMut<RenetServerResource>>,
+    mut pending: ResMut<PendingInputs>,
+    mut input_seqs: ResMut<InputSeqs>,
+    mut timestamps: ResMut<ClientTimestamps>,
+    client_net_ids: Res<ClientNetIds>,
+    config: Res<ServerConfig>,
+) {
+    let Some(mut server) = server_res else { return };
+
+    for client_id in server.0.clients_id() {
+        let Some(&(net_id, _)) = client_net_ids.0.get(&client_id) else {
+            continue;
+        };
+        while let Some(bytes) = server
+            .0
+            .receive_message(client_id, DefaultChannel::Unreliable)
+        {
+            let Ok(ClientMessage::Input(cmd)) = bitcode::decode::<ClientMessage>(bytes.as_ref())
+            else {
+                continue;
+            };
+            if !cmd.checksum_valid() || cmd.config_hash != config.0.content_hash {
+                continue;
+            }
+            let last = input_seqs.0.entry(net_id.0).or_insert(0);
+            if cmd.seq <= *last {
+                continue;
+            }
+            *last = cmd.seq;
+            timestamps.0.insert(net_id.0, cmd.client_time_us);
+            pending.inputs.insert(net_id.0, cmd);
         }
     }
+}
 
-    // 弹道实体也随快照下发，供客户端渲染
+/// 已认证客户端的玩法消息（购买 / 售出）。
+///
+/// `handle_session_messages` 只处理**未认证**连接，`receive_inputs` 只解 Unreliable
+/// 通道上的 `Input`；此前 `PurchaseItem` 落在两处 `_ => {}` 里被静默丢弃。
+/// 本系统补上 ReliableOrdered 通道的玩法 opcode，并把协议 `u32` 反查为玩法 `&str` id。
+fn handle_gameplay_messages(
+    server_res: Option<ResMut<RenetServerResource>>,
+    client_net_ids: Res<ClientNetIds>,
+    mut intents: ResMut<crate::gameplay::ShopIntents>,
+    mut sells: ResMut<crate::gameplay::SellIntents>,
+    tick: Res<crate::simulation::ServerTick>,
+    mut clock: Option<ResMut<MatchClock>>,
+) {
+    let Some(mut server) = server_res else {
+        return;
+    };
+    for (client_id, (net_id, _team)) in client_net_ids.0.iter() {
+        while let Some(bytes) = server
+            .0
+            .receive_message(*client_id, DefaultChannel::ReliableOrdered)
+        {
+            let Ok(msg) = bitcode::decode::<ClientMessage>(bytes.as_ref()) else {
+                continue;
+            };
+            match msg {
+                // 已在认证之后（或重连后）单独抵达的模式选择。
+                ClientMessage::SelectMode { mode } => apply_match_mode(&mut clock, mode),
+                ClientMessage::PurchaseItem { item_id } => {
+                    let Some(name) = registry::item_name(item_id) else {
+                        continue;
+                    };
+                    intents.0.push((
+                        net_id.0,
+                        shop::ShopRequest {
+                            item_id: name,
+                            // 距离/阵亡/tick 一律由服务端重算，绝不采信客户端
+                            distance_to_source: 0.0,
+                            is_dead: false,
+                            death_tick: 0,
+                            current_tick: tick.0,
+                        },
+                    ));
+                }
+                ClientMessage::SellItem { slot } => {
+                    sells.0.push((net_id.0, slot));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// 协议 v3：英雄快照携带 `CH_STATUS` / `CH_SHIELD`，并把哨塔与兵线一并下发，
+/// 使客户端能显示状态/护盾以及可交互的世界实体。
+#[allow(clippy::type_complexity)]
+fn collect_entities(
+    heroes: &Query<(
+        &NetId,
+        &Team,
+        &Hero,
+        &TransformSync,
+        &HeroAbilities,
+        Option<&combat::StatusEffects>,
+        Option<&combat::ShieldPool>,
+    )>,
+    projectiles: &Query<(&NetId, &Team, &TransformSync, &Projectile)>,
+    turrets: &Query<(&NetId, &Team, &TransformSync, &Turret)>,
+    minions: &Query<(&NetId, &Team, &TransformSync, &Minion)>,
+) -> Vec<EntitySnapshot> {
+    let mut entities: Vec<EntitySnapshot> = heroes
+        .iter()
+        .map(
+            |(net_id, team, hero, ts, abilities, status, shield)| EntitySnapshot {
+                net_id: *net_id,
+                entity_type: EntityType::Hero,
+                team: *team,
+                position: Vec3f::from_vec3(ts.position),
+                rotation: Quatf::new(ts.rotation.x, ts.rotation.y, ts.rotation.z, ts.rotation.w),
+                velocity: Vec3f::from_vec3(ts.velocity),
+                health: hero.health,
+                max_health: hero.max_health,
+                energy: hero.energy,
+                max_energy: hero.max_energy,
+                level: hero.level,
+                gold: hero.gold,
+                ability_cooldowns: abilities.cooldowns,
+                status_mask: status.map(|s| s.status_mask()).unwrap_or(0),
+                shield: shield.map(|s| s.value).unwrap_or(0.0),
+            },
+        )
+        .collect();
+
+    for (net_id, team, ts, tur) in turrets.iter() {
+        entities.push(EntitySnapshot {
+            net_id: *net_id,
+            entity_type: EntityType::Turret,
+            team: *team,
+            position: Vec3f::from_vec3(ts.position),
+            rotation: Quatf::default(),
+            velocity: Vec3f::zero(),
+            health: tur.health,
+            max_health: tur.max_health,
+            energy: 0.0,
+            max_energy: 0.0,
+            level: 0,
+            gold: 0,
+            ability_cooldowns: [0.0; 4],
+            status_mask: 0,
+            shield: 0.0,
+        });
+    }
+
+    for (net_id, team, ts, minion) in minions.iter() {
+        entities.push(EntitySnapshot {
+            net_id: *net_id,
+            entity_type: EntityType::Minion,
+            team: *team,
+            position: Vec3f::from_vec3(ts.position),
+            rotation: Quatf::default(),
+            velocity: Vec3f::zero(),
+            health: minion.health,
+            max_health: minion.max_health,
+            energy: 0.0,
+            max_energy: 0.0,
+            level: 0,
+            gold: 0,
+            ability_cooldowns: [0.0; 4],
+            status_mask: 0,
+            shield: 0.0,
+        });
+    }
+
     for (net_id, team, ts, proj) in projectiles.iter() {
         entities.push(EntitySnapshot {
             net_id: *net_id,
@@ -417,55 +749,173 @@ fn broadcast_snapshot(
             level: 0,
             gold: 0,
             ability_cooldowns: [0.0; 4],
+            status_mask: 0,
+            shield: 0.0,
         });
     }
+    entities
+}
 
-    let events = std::mem::take(&mut server_events.0);
-    let snapshot = WorldSnapshot {
-        tick: tick.0,
-        server_time: 0.0,
-        entities,
-        events,
+/// 视野裁剪 + 增量编码 + 通道分级；状态走 Unreliable，关键事件走 ReliableOrdered 且幂等。
+#[allow(clippy::too_many_arguments)]
+fn broadcast_snapshot(
+    server_res: Option<ResMut<RenetServerResource>>,
+    transport_res: Option<ResMut<ServerTransportResource>>,
+    #[allow(clippy::type_complexity)] heroes: Query<(
+        &NetId,
+        &Team,
+        &Hero,
+        &TransformSync,
+        &HeroAbilities,
+        Option<&combat::StatusEffects>,
+        Option<&combat::ShieldPool>,
+    )>,
+    projectiles: Query<(&NetId, &Team, &TransformSync, &Projectile)>,
+    turrets: Query<(&NetId, &Team, &TransformSync, &Turret)>,
+    minions: Query<(&NetId, &Team, &TransformSync, &Minion)>,
+    mut server_events: ResMut<ServerEvents>,
+    tick: Res<crate::simulation::ServerTick>,
+    config: Res<ServerConfig>,
+    client_net_ids: Res<ClientNetIds>,
+    mut views: ResMut<ClientViews>,
+    mut cursor: ResMut<EventCursor>,
+    timestamps: Res<ClientTimestamps>,
+    mut match_started: ResMut<MatchStarted>,
+) {
+    let (Some(mut server), Some(mut transport)) = (server_res, transport_res) else {
+        return;
     };
 
-    for client_id in server.0.clients_id() {
-        server.0.send_message(
-            client_id,
-            DefaultChannel::ReliableOrdered,
-            bitcode::encode(&ServerMessage::WorldSnapshot(snapshot.clone())),
-        );
+    let entities = collect_entities(&heroes, &projectiles, &turrets, &minions);
+    let vision = &config.0.tables.vision;
+    let policy = VisibilityPolicy {
+        vision_radius: vision.vision_radius,
+        brush_reveal_radius: vision.brush_reveal_radius,
+        constructs_provide_vision: vision.constructs_provide_vision,
+        sentries_provide_vision: vision.sentries_provide_vision,
+    };
+
+    // 每个玩家独立可见集（VIS-1）
+    let mut per_client: Vec<(ClientId, NetId, Team, gx_net::VisibilitySet)> = Vec::new();
+    for (client_id, (net_id, team)) in client_net_ids.0.iter() {
+        let set = compute_visibility(*team, &policy, &entities);
+        per_client.push((*client_id, *net_id, *team, set));
     }
 
-    // 当蓝红两队都至少各有一名玩家时，下发一次 MatchStart
+    // 关键事件：过滤后带 event_id 幂等下发（FR-53 / VIS-6/7）
+    let events = std::mem::take(&mut server_events.0);
+    for ev in &events {
+        cursor.0 += 1;
+        let envelope = EventEnvelope {
+            event_id: cursor.0,
+            payload: bitcode::encode(ev),
+        };
+        for (client_id, _, _, set) in &per_client {
+            if event_visible(ev, set) {
+                send_reliable(
+                    &mut server.0,
+                    *client_id,
+                    &ServerMessage::ReliableEvent(envelope.clone()),
+                );
+            }
+        }
+    }
+
+    // 状态快照：20Hz 增量；每 2s 或首次/重连补基线
+    if tick.0.is_multiple_of(SNAPSHOT_INTERVAL_TICKS) || !events.is_empty() {
+        for (client_id, net_id, _team, set) in &per_client {
+            let visible_entities: Vec<EntitySnapshot> = entities
+                .iter()
+                .filter(|e| set.contains(e.net_id.0))
+                .cloned()
+                .collect();
+            let visible_ids: HashSet<u64> = visible_entities.iter().map(|e| e.net_id.0).collect();
+            let full: Vec<EntityDelta> = visible_entities.iter().map(|e| e.to_delta()).collect();
+
+            let view = views.0.entry(*client_id).or_default();
+            let need_baseline = view.last_sent.is_empty()
+                || tick.0.saturating_sub(view.last_baseline_tick) >= BASELINE_INTERVAL_TICKS;
+
+            let removed: Vec<u64> = view
+                .last_sent
+                .keys()
+                .filter(|id| !visible_ids.contains(id))
+                .copied()
+                .collect();
+            let mut deltas = Vec::new();
+            let mut baseline = None;
+            if need_baseline {
+                view.last_sent.clear();
+                for d in &full {
+                    view.last_sent.insert(d.net_id, d.clone());
+                }
+                view.last_baseline_tick = tick.0;
+                baseline = Some(full);
+            } else {
+                for d in &full {
+                    match view.last_sent.get(&d.net_id) {
+                        Some(prev) => {
+                            let diff = gx_net::diff_entity(prev, d);
+                            if diff.changed_mask != 0 {
+                                deltas.push(diff);
+                            }
+                        }
+                        None => deltas.push(d.clone()),
+                    }
+                }
+                for d in &full {
+                    view.last_sent.insert(d.net_id, d.clone());
+                }
+                for id in &removed {
+                    view.last_sent.remove(id);
+                }
+            }
+
+            view.view_seq = view.view_seq.wrapping_add(1);
+            let snapshot = Snapshot {
+                header: SnapshotHeader {
+                    tick: tick.0,
+                    baseline_tick: view.last_baseline_tick,
+                    config_hash: config.0.content_hash,
+                    view_seq: view.view_seq,
+                    client_time_us: *timestamps.0.get(&net_id.0).unwrap_or(&0),
+                },
+                deltas,
+                removed,
+                baseline,
+            };
+            server.0.send_message(
+                *client_id,
+                DefaultChannel::Unreliable,
+                bitcode::encode(&ServerMessage::Snapshot(snapshot)),
+            );
+        }
+    }
+
+    // 双方各至少 1 人时下发一次 MatchStart
     if !match_started.0 {
         let mut blue = Vec::new();
         let mut red = Vec::new();
-        for (net_id, team, hero, _, _) in heroes.iter() {
+        for (net_id, team, hero, _, _, _, _) in heroes.iter() {
             let entry = (*net_id, hero.name.clone());
             match team {
                 Team::Blue => blue.push(entry),
                 Team::Red => red.push(entry),
-                Team::Neutral => {} // 中立实体（如训练假人）不计入双方英雄列表
+                Team::Neutral => {}
             }
         }
         if !blue.is_empty() && !red.is_empty() {
-            let blue_count = blue.len();
-            let red_count = red.len();
             let event = ServerMessage::Event(GameEvent::MatchStart {
                 blue_heroes: blue,
                 red_heroes: red,
             });
-            for client_id in server.0.clients_id() {
-                server.0.send_message(
-                    client_id,
-                    DefaultChannel::ReliableOrdered,
-                    bitcode::encode(&event),
-                );
+            for (client_id, _, _, _) in &per_client {
+                send_reliable(&mut server.0, *client_id, &event);
             }
             match_started.0 = true;
-            info!("Match started with {} vs {}", blue_count, red_count);
+            info!("Match started");
         }
     }
 
-    let _ = transport.0.send_packets(&mut server.0);
+    transport.0.send_packets(&mut server.0);
 }

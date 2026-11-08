@@ -5,8 +5,12 @@ edition = "2024"
 
 [dependencies]
 bevy = { workspace = true }
-glam = { workspace = true }
+gx-net = { path = "../gx-net" }
+gx-config = { path = "../gx-config" }
 serde = { workspace = true }
 bitcode = { workspace = true }
 thiserror = { workspace = true }
 fixed = "1.0"
+
+[lints]
+workspace = true

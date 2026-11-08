@@ -1,21 +1,17 @@
-//! Vainglory 服务端入口（Headless）
+//! GX-01 战斗服务端入口（Headless）
 
 use bevy::asset::Assets;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::render::mesh::Mesh;
 use server::{
-    networking::NetworkingPlugin,
-    simulation::SimulationPlugin,
-    spawn::SpawnPlugin,
-    ServerPlugin,
+    ServerPlugin, networking::NetworkingPlugin, simulation::SimulationPlugin, spawn::SpawnPlugin,
 };
 
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 

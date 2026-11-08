@@ -1,10 +1,13 @@
 //! 实体插值系统（远端实体平滑渲染）
 
+use crate::networking::{HeroRegistry, ReceivedSnapshot};
+use crate::visual::VoxelMaterialPool;
+use crate::voxel::{MinionVisual, PixelKind, spawn_voxel_minion};
+use bevy::image::Image;
 use bevy::prelude::*;
 use game_core::components::*;
-use game_core::net::{WorldSnapshot, EntitySnapshot, EntityType, Vec3f, Quatf};
-use game_core::math::{lerp_vec3, lerp_quat, TickClock};
-use crate::networking::ReceivedSnapshot;
+use game_core::math::{TickClock, lerp_quat, lerp_vec3};
+use game_core::net::{EntitySnapshot, EntityType, Quatf, Vec3f};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// 客户端用于渲染弹道的可视化标记
@@ -15,12 +18,19 @@ pub struct InterpolationPlugin;
 
 impl Plugin for InterpolationPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<EntityHistory>()
-            .add_systems(FixedUpdate, (
+        app.init_resource::<EntityHistory>().add_systems(
+            FixedUpdate,
+            (
                 sync_projectiles,
+                sync_minions,
+                crate::entity_visual::sync_monsters,
                 store_snapshot_history,
                 interpolate_entities,
-            ).chain());
+                sync_hero_stats,
+                crate::entity_visual::tick_non_hero_anim,
+            )
+                .chain(),
+        );
     }
 }
 
@@ -38,8 +48,13 @@ impl EntityHistory {
             history.pop_front();
         }
     }
-    
-    pub fn get_interpolated(&self, net_id: NetId, target_tick: u64, alpha: f32) -> Option<EntitySnapshot> {
+
+    pub fn get_interpolated(
+        &self,
+        net_id: NetId,
+        _target_tick: u64,
+        alpha: f32,
+    ) -> Option<EntitySnapshot> {
         let history = self.histories.get(&net_id)?;
 
         // EntitySnapshot 本身不携带 tick，这里在最近两帧之间做插值
@@ -76,7 +91,9 @@ fn sync_projectiles(
     snapshot: Option<Res<ReceivedSnapshot>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut pool: ResMut<VoxelMaterialPool>,
     existing: Query<(Entity, &NetId), With<ProjectileVisual>>,
 ) {
     let Some(snapshot) = snapshot else { return };
@@ -96,17 +113,18 @@ fn sync_projectiles(
             continue;
         }
 
-        let color = match es.team {
-            Team::Blue => Color::srgb(0.3, 0.6, 1.0),
-            Team::Red => Color::srgb(1.0, 0.5, 0.2),
-            Team::Neutral => Color::srgb(0.7, 0.7, 0.7),
+        // PRES-4：3D 弹体必须是轴对齐方块；语义色来自统一调色板，
+        // 网格与特效材质都经 `VoxelMaterialPool` 复用，不再每次新建。
+        let kind = match es.team {
+            Team::Blue => PixelKind::Blue,
+            Team::Red => PixelKind::Red,
+            Team::Neutral => PixelKind::Marker,
         };
+        let cube = pool.cube(&mut meshes);
+        let fx = pool.fx_material(&mut images, &mut materials, kind, 61);
         commands.spawn((
-            Mesh3d(meshes.add(Sphere::new(1.0))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: color,
-                ..default()
-            })),
+            Mesh3d(cube),
+            MeshMaterial3d(fx),
             Transform::from_translation(es.position.into()),
             es.net_id,
             es.team,
@@ -124,12 +142,65 @@ fn sync_projectiles(
     }
 }
 
+/// 根据快照创建 / 回收小兵可视化实体。
+/// 小兵只在视野内出现在快照中，因此“消失”时直接回收即可。
+fn sync_minions(
+    snapshot: Option<Res<ReceivedSnapshot>>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    existing: Query<(Entity, &NetId), With<MinionVisual>>,
+) {
+    let Some(snapshot) = snapshot else { return };
+    if snapshot.0.tick == 0 {
+        return; // 尚未收到有效快照
+    }
+
+    let mut seen: HashSet<NetId> = HashSet::new();
+    let mut existing_map: HashMap<NetId, Entity> = HashMap::new();
+    for (e, nid) in existing.iter() {
+        existing_map.insert(*nid, e);
+    }
+
+    for es in &snapshot.0.entities {
+        if es.entity_type != EntityType::Minion {
+            continue;
+        }
+        seen.insert(es.net_id);
+        if existing_map.contains_key(&es.net_id) {
+            continue;
+        }
+        let entity = spawn_voxel_minion(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut images,
+            es.team,
+            es.position.into(),
+        );
+        commands.entity(entity).insert((
+            es.net_id,
+            es.team,
+            TransformSync::default(),
+            Interpolated,
+            MinionVisual,
+        ));
+    }
+
+    for (nid, e) in existing_map {
+        if !seen.contains(&nid) {
+            commands.entity(e).despawn();
+        }
+    }
+}
+
 fn store_snapshot_history(
     mut history: ResMut<EntityHistory>,
     snapshot: Option<Res<ReceivedSnapshot>>,
 ) {
     let Some(snapshot) = snapshot else { return };
-    
+
     for entity_snap in &snapshot.0.entities {
         history.add_snapshot(entity_snap);
     }
@@ -138,32 +209,53 @@ fn store_snapshot_history(
 fn interpolate_entities(
     tick_clock: Res<TickClock>,
     history: Res<EntityHistory>,
-    mut query: Query<(&mut Transform, &mut TransformSync, &NetId, Option<&mut Hero>), With<Interpolated>>,
+    mut query: Query<(&mut Transform, &mut TransformSync, &NetId), With<Interpolated>>,
 ) {
     let target_tick = tick_clock.current_tick;
     let alpha = tick_clock.interpolation_alpha();
-    
-    for (mut transform, mut sync, net_id, hero) in query.iter_mut() {
+
+    for (mut transform, mut sync, net_id) in query.iter_mut() {
         if let Some(interpolated) = history.get_interpolated(*net_id, target_tick, alpha) {
             transform.translation = interpolated.position.into();
             transform.rotation = interpolated.rotation.into();
             sync.position = interpolated.position.into();
             sync.rotation = interpolated.rotation.into();
             sync.velocity = interpolated.velocity.into();
-            // 从服务端快照同步血量（敌方英雄 / 训练假人均为 Interpolated，仅本地玩家是 Predicted 故被排除），
-            // 否则敌人血量永远停留在初始值，血条看着“不掉血”。
-            if let Some(mut hero) = hero {
-                hero.health = interpolated.health;
-                hero.max_health = interpolated.max_health;
-                if hero.health < hero.max_health - 0.5 {
-                    info!(
-                        "[CLT-INT] net={:?} health={:.1}/{:.1}",
-                        net_id, hero.health, hero.max_health
-                    );
-                }
-            }
-        } else if hero.is_some() {
-            info!("[CLT-INT] NO HISTORY for net={:?}", net_id);
+        }
+    }
+}
+
+/// 用服务端快照同步所有英雄的数值面板（含本地预测英雄）。
+///
+/// 之前只同步 `Interpolated` 敌人，导致本地玩家的血量 / 能量 / 等级永远停留在初始值，
+/// 本地血条与 HUD 实际“显示异常”。这里按 NetId 统一写回，位置仍由预测/插值负责。
+fn sync_hero_stats(
+    snapshot: Option<Res<ReceivedSnapshot>>,
+    registry: Res<HeroRegistry>,
+    mut heroes: Query<(&NetId, &mut Hero, Option<&mut HeroAbilities>)>,
+) {
+    let Some(snapshot) = snapshot else { return };
+    if snapshot.0.tick == 0 {
+        return;
+    }
+    for es in &snapshot.0.entities {
+        if es.entity_type != EntityType::Hero {
+            continue;
+        }
+        let Some(&entity) = registry.0.get(&es.net_id) else {
+            continue;
+        };
+        let Ok((_, mut hero, abilities)) = heroes.get_mut(entity) else {
+            continue;
+        };
+        hero.health = es.health;
+        hero.max_health = es.max_health;
+        hero.energy = es.energy;
+        hero.max_energy = es.max_energy;
+        hero.level = es.level;
+        hero.gold = es.gold;
+        if let Some(mut abilities) = abilities {
+            abilities.cooldowns = es.ability_cooldowns;
         }
     }
 }

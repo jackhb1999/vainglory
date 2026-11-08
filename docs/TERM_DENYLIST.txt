@@ -1,0 +1,31 @@
+# GX-01 表达层禁用词表（`GX-ARCH-2026-001` §2.2 / `DEV-26` / `TC-COMPLIANCE-01`）
+# 每行一个词条；以 # 开头的行为注释；大小写敏感、按词边界匹配 ASCII 词条。
+# 本文件位于 docs/ 白名单内；CI 扫描器读取本文件后扫描其余工作树。
+Vainglory
+虚荣
+最终荣耀
+Super Evil
+SEMC
+E.V.I.L
+Halcyon
+Halcyon Fold
+海希安
+Sovereign's Rise
+风暴高地
+Vain Crystal
+虚荣水晶
+Kraken
+克拉肯
+Gold Mine
+Minion Mine
+金矿工
+水晶哨兵
+Sanctuary
+WP
+CP
+ICE
+Glory
+Opals
+Blitz
+ARAL
+Ringo

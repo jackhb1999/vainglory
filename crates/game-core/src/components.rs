@@ -1,9 +1,9 @@
 //! 游戏实体组件定义
 
+use crate::net::JungleMonsterType;
 use bevy::prelude::*;
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
-use crate::net::JungleMonsterType;
 
 /// 伤害结算时回填的事件汇（attacker, target, 实际伤害, 伤害类型），
 /// 由服务端的 flush_damage_events 系统转换为 `GameEvent::DamageDealt` 广播给客户端。
@@ -11,7 +11,9 @@ use crate::net::JungleMonsterType;
 pub struct DamageSink(pub Vec<(Entity, Entity, f32, DamageType)>);
 
 /// 阵营
-#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+#[derive(
+    Component, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode,
+)]
 pub enum Team {
     Blue,
     Red,
@@ -37,6 +39,8 @@ pub const HERO_BASE_MOVE_SPEED: f32 = 8.0;
 #[derive(Component, Clone, Debug, Serialize, Deserialize)]
 pub struct Hero {
     pub name: String,
+    /// 外观皮肤编号：用于客户端 voxel 模型区分（颜色 / 头饰 / 轮廓），与数值无关。
+    pub skin: u8,
     pub level: u8,
     pub experience: u32,
     pub gold: u32,
@@ -59,6 +63,7 @@ impl Default for Hero {
     fn default() -> Self {
         Self {
             name: "Hero".to_string(),
+            skin: 0,
             level: 1,
             experience: 0,
             gold: 0,
@@ -115,12 +120,12 @@ pub struct Turret {
     pub last_attack_tick: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq,Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurretType {
     Outer,
     Inner,
     Base,
-    VainCrystal,
+    SourceCore,
 }
 
 /// 野怪组件
@@ -141,9 +146,6 @@ pub struct JungleMonster {
     pub spawn_tick: u64,
     pub last_attacker: Option<NetId>,
 }
-
-
-
 
 /// 技能组件
 #[derive(Component, Clone, Debug, Serialize, Deserialize)]
@@ -270,7 +272,9 @@ impl Default for PlayerInput {
 }
 
 /// 网络实体 ID（服务端权威分配）
-#[derive(Component,  Encode, Decode,Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Component, Encode, Decode, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize,
+)]
 pub struct NetId(pub u64);
 
 /// 位置同步组件
@@ -294,21 +298,11 @@ impl Default for TransformSync {
 }
 
 /// 仇恨组件
-#[derive(Component, Clone, Debug, Serialize, Deserialize)]
+#[derive(Component, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Aggro {
     pub target: Option<NetId>,
     pub threat_table: Vec<(NetId, f32)>,
     pub last_update_tick: u64,
-}
-
-impl Default for Aggro {
-    fn default() -> Self {
-        Self {
-            target: None,
-            threat_table: Vec::new(),
-            last_update_tick: 0,
-        }
-    }
 }
 
 /// 选择器（用于点击选中）
@@ -317,6 +311,16 @@ pub struct Selectable {
     pub radius: f32,
     pub height: f32,
 }
+
+/// 圆形碰撞体（XZ 平面）。服务端碰撞解算用，避免实体之间及与静态障碍穿模。
+#[derive(Component, Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct Collider {
+    pub radius: f32,
+}
+
+/// 静态碰撞体标记（塔 / 源核 / 训练假人）：仅作为不可穿透障碍，不参与被推开。
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct StaticCollider;
 
 /// 标记：本地玩家控制的实体
 #[derive(Component, Clone, Copy, Debug, Default, Serialize, Deserialize)]

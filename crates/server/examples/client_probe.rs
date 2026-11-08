@@ -1,6 +1,6 @@
 //! 探测：连接正在运行的真实服务端二进制（127.0.0.1:5000），验证链路。
 use game_core::net::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
-use renet2::{ClientId, ConnectionConfig, DefaultChannel, RenetClient};
+use renet2::{ConnectionConfig, DefaultChannel, RenetClient};
 use renet2_netcode::{ClientAuthentication, NativeSocket, NetcodeClientTransport};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,7 +35,9 @@ fn main() {
                         println!("GOT WELCOME net_id={:?} after {} ticks", your_net_id, i);
                         return;
                     }
-                    ServerMessage::Event(game_core::net::GameEvent::HeroSpawn { net_id, .. }) => {
+                    ServerMessage::Event(game_core::net::GameEvent::HeroSpawn {
+                        net_id, ..
+                    }) => {
                         println!("GOT HeroSpawn net_id={:?} after {} ticks", net_id, i);
                     }
                     _ => {}
@@ -44,14 +46,24 @@ fn main() {
         }
         if i % 60 == 0 {
             // 顺便发一帧输入，验证上行链路
-            let bytes = bitcode::encode(&ClientMessage::Input(game_core::net::InputCmd {
+            let cmd = game_core::net::InputCmd {
                 tick: 0,
+                seq: (i / 60) as u32,
+                client_time_us: 0,
                 move_dir: game_core::net::Vec2f::new(1.0, 0.0),
                 aim_dir: game_core::net::Vec2f::zero(),
                 ability_mask: 0,
                 target_net_id: None,
                 ping: 0,
-            }));
+                config_hash: gx_config::ConfigSet::load_default_with_gameplay(
+                    game_core::gameplay::registry::content_digest(),
+                )
+                .unwrap()
+                .content_hash,
+                checksum: 0,
+            }
+            .with_checksum();
+            let bytes = bitcode::encode(&ClientMessage::Input(cmd));
             client.send_message(DefaultChannel::Unreliable, bytes);
             let _ = transport.send_packets(&mut client);
         }

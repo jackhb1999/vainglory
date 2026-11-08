@@ -4,15 +4,15 @@
 
 pub mod abilities;
 pub mod components;
-pub mod systems;
+pub mod gameplay;
 pub mod map;
-pub mod net;
 pub mod math;
+pub mod net;
+pub mod systems;
+pub mod visibility;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_workspace_compiles() {
         // 确保 game-core 能编译

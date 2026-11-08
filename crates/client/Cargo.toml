@@ -1,17 +1,23 @@
 [package]
 name = "client"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
 
 [[bin]]
-name = "vainglory-client"
+name = "gx-client"
 path = "src/main.rs"
+
+[features]
+default = []
+offline-dev = []
+dev-tools = []
 
 [dependencies]
 bevy = { workspace = true }
 bevy_egui = { workspace = true }
 game-core = { path = "../game-core" }
+gx-net = { path = "../gx-net" }
+gx-config = { path = "../gx-config" }
 renet2 = { workspace = true }
 renet2_netcode = { workspace = true }
 serde = { workspace = true }
@@ -20,4 +26,6 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
-server = { path = "../server" }
+
+[lints]
+workspace = true

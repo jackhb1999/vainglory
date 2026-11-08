@@ -3,6 +3,7 @@
 use bevy::prelude::*;
 use game_core::abilities::*;
 use game_core::components::*;
+use game_core::map::MAP_HALF;
 use game_core::net::{GameEvent, Vec3f};
 use game_core::systems::*;
 
@@ -56,19 +57,34 @@ pub fn ability_cast_system(
             abilities.cooldowns[slot as usize] = def.cooldown;
 
             let caster_pos = transform.translation;
-            // aim_dir 现在是鼠标在地面上的绝对世界坐标 (x,z)
-            let target = Vec3::new(input.aim_dir.x, 0.0, input.aim_dir.y);
-            let to_target = target - caster_pos;
-            let dist = to_target.length();
-            // 瞄准方向（世界 x,z 平面，归一化）；无有效目标时兜底朝前
+            // `aim_dir` 是鼠标在地面上的**绝对世界坐标** (x,z)，不是方向向量。
+            // 拒绝零值 / NaN / 越界：旧版把客户端相机查询失败时上报的 (0,0)
+            // 当成合法目标，技能因此固定打向地图原点。
+            let aim_xz = Vec2::new(input.aim_dir.x, input.aim_dir.y);
+            let valid = aim_xz.is_finite()
+                && aim_xz.length_squared() > 1e-4
+                && aim_xz.x.abs() <= MAP_HALF
+                && aim_xz.y.abs() <= MAP_HALF;
+            // 距离取水平距离：旧版用 3D `length()` 会被施法者的 y 分量污染。
+            let flat = Vec2::new(aim_xz.x - caster_pos.x, aim_xz.y - caster_pos.z);
+            let dist = if valid { flat.length() } else { 0.0 };
             let aim = if dist > 1e-4 {
-                to_target / dist
+                Vec3::new(flat.x / dist, 0.0, flat.y / dist)
             } else {
                 Vec3::new(0.0, 0.0, -1.0)
             };
-            // 落点：沿瞄准方向，取“点击距离”与“技能射程”的较小值
-            // → 落在鼠标点击处；超出射程则压到射程边缘（与客户端范围环一致）
-            let center = caster_pos + aim * dist.min(def.range);
+            // 射程内直接采用上报点（= 鼠标点击处），超出射程压到射程边缘；
+            // 无效目标不再发射到地图原点，落点留在施法者脚下。
+            let center = if valid {
+                let reach = dist.min(def.range);
+                Vec3::new(
+                    caster_pos.x + aim.x * reach,
+                    0.0,
+                    caster_pos.z + aim.z * reach,
+                )
+            } else {
+                caster_pos
+            };
             let damage = def.damage(hero.attack_damage, hero.ability_power);
 
             match def.cast_type {
@@ -134,11 +150,13 @@ pub fn ability_cast_system(
 /// 弹道系统：推进弹体、检测命中、命中后通过 AttackCommand 走统一伤害结算。
 pub fn projectile_system(
     mut commands: Commands,
-    time: Res<Time>,
+    time: Res<SimTime>,
     heroes: Query<(Entity, &Transform, &Team)>,
     mut projectiles: Query<(Entity, &mut TransformSync, &mut Projectile)>,
 ) {
-    let dt = time.delta_secs().min(FIXED_TIMESTEP * 3.0);
+    // 权威固定步长：不用墙钟 delta，保证命中裁决与回放可复现。
+    let dt = time.delta_secs();
+    let current_tick = time.tick();
 
     // 先快照英雄位置（只读 Transform），再单独遍历弹体（只写 TransformSync，避免读写冲突）
     let hero_snapshot: Vec<(Entity, Vec3, Team)> = heroes
@@ -177,7 +195,7 @@ pub fn projectile_system(
                 attacker: proj_entity,
                 damage: proj.damage,
                 damage_type: proj.damage_type,
-                tick: 0,
+                tick: current_tick,
             });
             proj.dead = true;
         } else if proj.traveled >= proj.max_range {
@@ -207,7 +225,7 @@ pub fn resolve_pending_hits(
 /// 把本帧累积的伤害事件（DamageSink）转换为 `GameEvent::DamageDealt` 广播给客户端，
 /// 让攻击方也能看到伤害数字与受击反馈。
 pub fn flush_damage_events(
-    mut damage_sink: Option<ResMut<game_core::components::DamageSink>>,
+    damage_sink: Option<ResMut<game_core::components::DamageSink>>,
     net_ids: Query<(Entity, &NetId)>,
     mut server_events: ResMut<ServerEvents>,
 ) {

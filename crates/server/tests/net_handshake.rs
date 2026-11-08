@@ -2,19 +2,40 @@
 //! 验证客户端能收到 Welcome / HeroSpawn / MatchStart，且服务端生成了对应英雄实体。
 
 use bevy::prelude::*;
-use game_core::net::{ClientMessage, GameEvent, InputCmd, ServerMessage, Vec2f, PROTOCOL_VERSION};
+use game_core::components::*;
+use game_core::net::{
+    ClientMessage, GameEvent, InputCmd, PROTOCOL_VERSION, ServerMessage, SessionHello,
+    SessionToken, Vec2f, VersionHello,
+};
 use renet2::{ConnectionConfig, DefaultChannel, RenetClient};
 use renet2_netcode::{ClientAuthentication, NativeSocket, NetcodeClientTransport};
 use server::networking::NetworkingPlugin;
 use server::simulation::SimulationPlugin;
 use server::systems::*;
-use game_core::components::*;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct TestClient {
     client: RenetClient,
     transport: NetcodeClientTransport,
+    token: SessionToken,
+    hello_sent: bool,
+    seq: u32,
+}
+
+fn config_hash() -> [u8; 32] {
+    gx_config::ConfigSet::load_default_with_gameplay(
+        game_core::gameplay::registry::content_digest(),
+    )
+    .unwrap()
+    .content_hash
+}
+
+fn random_token() -> SessionToken {
+    let mut token = [0u8; 16];
+    token[..8].copy_from_slice(&rand::random::<u64>().to_le_bytes());
+    token[8..].copy_from_slice(&rand::random::<u64>().to_le_bytes());
+    token
 }
 
 fn spawn_server_app(port: u16) -> App {
@@ -43,15 +64,40 @@ fn connect_client(port: u16) -> TestClient {
     let client = RenetClient::new(connection_config, false);
     let transport = NetcodeClientTransport::new(current_time, authentication, socket)
         .expect("client transport");
-    TestClient { client, transport }
+    TestClient {
+        client,
+        transport,
+        token: random_token(),
+        hello_sent: false,
+        seq: 0,
+    }
 }
 
-/// 推进客户端一帧；返回该帧收到的所有 ServerMessage。
+/// 推进客户端一帧；连接建立后发送一次会话 Hello（FR-62），返回该帧收到的所有 ServerMessage。
 fn step_client(c: &mut TestClient, delta: Duration) -> Vec<ServerMessage> {
     c.client.update(delta);
     let _ = c.transport.update(delta, &mut c.client);
+    if !c.hello_sent && c.client.is_connected() {
+        let hello = VersionHello {
+            protocol_version: PROTOCOL_VERSION,
+            config_hash: config_hash(),
+        };
+        let msg = ClientMessage::Hello(SessionHello {
+            token: c.token,
+            hello,
+        });
+        c.client
+            .send_message(DefaultChannel::ReliableOrdered, bitcode::encode(&msg));
+        c.hello_sent = true;
+    }
     let mut msgs = Vec::new();
     while let Some(bytes) = c.client.receive_message(DefaultChannel::ReliableOrdered) {
+        if let Ok(msg) = bitcode::decode::<ServerMessage>(bytes.as_ref()) {
+            msgs.push(msg);
+        }
+    }
+    // M1-d：状态增量快照走 Unreliable 通道
+    while let Some(bytes) = c.client.receive_message(DefaultChannel::Unreliable) {
         if let Ok(msg) = bitcode::decode::<ServerMessage>(bytes.as_ref()) {
             msgs.push(msg);
         }
@@ -67,14 +113,20 @@ fn step_server(app: &mut App) {
 
 /// 客户端向服务端发送一帧移动输入（不可靠通道，与正式客户端一致）。
 fn send_input(c: &mut TestClient, dir: Vec2f) {
+    c.seq += 1;
     let cmd = InputCmd {
         tick: 0,
+        seq: c.seq,
+        client_time_us: 0,
         move_dir: dir,
         aim_dir: Vec2f::zero(),
         ability_mask: 0,
         target_net_id: None,
         ping: 0,
-    };
+        config_hash: config_hash(),
+        checksum: 0,
+    }
+    .with_checksum();
     let bytes = bitcode::encode(&ClientMessage::Input(cmd));
     c.client.send_message(DefaultChannel::Unreliable, bytes);
     let _ = c.transport.send_packets(&mut c.client);
@@ -82,14 +134,20 @@ fn send_input(c: &mut TestClient, dir: Vec2f) {
 
 /// 带技能掩码与瞄准方向的输入发送。
 fn send_input_full(c: &mut TestClient, dir: Vec2f, aim: Vec2f, mask: u8) {
+    c.seq += 1;
     let cmd = InputCmd {
         tick: 0,
+        seq: c.seq,
+        client_time_us: 0,
         move_dir: dir,
         aim_dir: aim,
         ability_mask: mask,
         target_net_id: None,
         ping: 0,
-    };
+        config_hash: config_hash(),
+        checksum: 0,
+    }
+    .with_checksum();
     let bytes = bitcode::encode(&ClientMessage::Input(cmd));
     c.client.send_message(DefaultChannel::Unreliable, bytes);
     let _ = c.transport.send_packets(&mut c.client);
@@ -98,10 +156,7 @@ fn send_input_full(c: &mut TestClient, dir: Vec2f, aim: Vec2f, mask: u8) {
 /// 推进固定步长模拟（与 hero_moves_with_input 一致）：先 update 接收输入，再手动推进 FixedUpdate。
 fn step_sim(server: &mut App, delta: Duration) {
     step_server(server);
-    server
-        .world_mut()
-        .resource_mut::<Time>()
-        .advance_by(delta);
+    server.world_mut().resource_mut::<Time>().advance_by(delta);
     server.world_mut().run_schedule(FixedUpdate);
 }
 
@@ -156,8 +211,14 @@ fn client_connects_and_match_starts() {
     assert!(c2_match, "client2 should receive MatchStart");
 
     // 服务端应为两名玩家各分配一个 NetId（连接建立时即生成对应英雄实体）
-    let net_ids = server.world().resource::<server::networking::ClientNetIds>();
-    assert_eq!(net_ids.0.len(), 2, "server should track 2 connected clients");
+    let net_ids = server
+        .world()
+        .resource::<server::networking::ClientNetIds>();
+    assert_eq!(
+        net_ids.0.len(),
+        2,
+        "server should track 2 connected clients"
+    );
 }
 
 /// 验证「客户端输入 → 服务端权威模拟移动 → 快照」的链路：
@@ -181,10 +242,12 @@ fn hero_moves_with_input() {
             if let ServerMessage::Welcome { your_net_id, .. } = m {
                 my_net_id = Some(your_net_id);
             }
-            if let ServerMessage::Event(GameEvent::HeroSpawn { net_id, position, .. }) = m {
-                if Some(net_id) == my_net_id {
-                    spawn_x = position.x;
-                }
+            if let ServerMessage::Event(GameEvent::HeroSpawn {
+                net_id, position, ..
+            }) = m
+                && Some(net_id) == my_net_id
+            {
+                spawn_x = position.x;
             }
         }
         if my_net_id.is_some() {
@@ -208,10 +271,13 @@ fn hero_moves_with_input() {
     }
 
     // 读取服务端英雄的最终位置
-    let mut world = server.world_mut();
-    let mut hero_query = world.query::<(&game_core::components::NetId, &game_core::components::TransformSync)>();
+    let world = server.world_mut();
+    let mut hero_query = world.query::<(
+        &game_core::components::NetId,
+        &game_core::components::TransformSync,
+    )>();
     let mut final_x = None;
-    for (nid, sync) in hero_query.iter(&world) {
+    for (nid, sync) in hero_query.iter(world) {
         if *nid == net_id {
             final_x = Some(sync.position.x);
         }
@@ -245,10 +311,12 @@ fn hero_moves_in_z() {
             if let ServerMessage::Welcome { your_net_id, .. } = m {
                 my_net_id = Some(your_net_id);
             }
-            if let ServerMessage::Event(GameEvent::HeroSpawn { net_id, position, .. }) = m {
-                if Some(net_id) == my_net_id {
-                    spawn_z = position.z;
-                }
+            if let ServerMessage::Event(GameEvent::HeroSpawn {
+                net_id, position, ..
+            }) = m
+                && Some(net_id) == my_net_id
+            {
+                spawn_z = position.z;
             }
         }
         if my_net_id.is_some() {
@@ -269,10 +337,13 @@ fn hero_moves_in_z() {
         server.world_mut().run_schedule(FixedUpdate);
     }
 
-    let mut world = server.world_mut();
-    let mut hero_query = world.query::<(&game_core::components::NetId, &game_core::components::TransformSync)>();
+    let world = server.world_mut();
+    let mut hero_query = world.query::<(
+        &game_core::components::NetId,
+        &game_core::components::TransformSync,
+    )>();
     let mut final_z = None;
-    for (nid, sync) in hero_query.iter(&world) {
+    for (nid, sync) in hero_query.iter(world) {
         if *nid == net_id {
             final_z = Some(sync.position.z);
         }
@@ -323,10 +394,13 @@ fn ability_projectile_deals_damage() {
 
     // 将两名英雄摆到彼此附近：蓝 (0,0,0)，红 (0,0,5)
     {
-        let mut world = server.world_mut();
-        let mut q = world
-            .query::<(&game_core::components::NetId, &mut Transform, &mut game_core::components::TransformSync)>();
-        for (nid, mut tf, mut sync) in q.iter_mut(&mut world) {
+        let world = server.world_mut();
+        let mut q = world.query::<(
+            &game_core::components::NetId,
+            &mut Transform,
+            &mut game_core::components::TransformSync,
+        )>();
+        for (nid, mut tf, mut sync) in q.iter_mut(world) {
             if *nid == c1_id {
                 tf.translation = Vec3::new(0.0, 0.0, 0.0);
                 sync.position = Vec3::new(0.0, 0.0, 0.0);
@@ -345,10 +419,10 @@ fn ability_projectile_deals_damage() {
     }
 
     // 读取红方英雄血量
-    let mut world = server.world_mut();
+    let world = server.world_mut();
     let mut q = world.query::<(&game_core::components::NetId, &game_core::components::Hero)>();
     let mut red_health = None;
-    for (nid, hero) in q.iter(&world) {
+    for (nid, hero) in q.iter(world) {
         if *nid == c2_id {
             red_health = Some(hero.health);
         }
@@ -366,13 +440,16 @@ fn ability_projectile_deals_damage() {
 #[test]
 fn training_dummy_takes_damage() {
     let mut app = App::new();
-    app.add_plugins(MinimalPlugins).add_systems(
-        Update,
-        (
-            server::systems::projectile_system,
-            server::systems::damage_system,
-        ),
-    );
+    app.add_plugins(MinimalPlugins)
+        // 裁决系统统一读权威 SimTime；非 0 tick 用于验证弹体不再写死 tick=0。
+        .insert_resource(game_core::systems::SimTime(777))
+        .add_systems(
+            Update,
+            (
+                server::systems::projectile_system,
+                server::systems::damage_system,
+            ),
+        );
 
     // 中立训练假人，放在原点，高血量
     let dummy = app
@@ -419,13 +496,27 @@ fn training_dummy_takes_damage() {
         ))
         .id();
 
-    // 跑多帧：第 1 帧弹体命中并插入 AttackCommand（延迟命令在帧末 flush），
-    // 第 2 帧 damage_system 才能读到并结算伤害。
-    for _ in 0..5 {
+    // 第 1 帧弹体命中并插入 AttackCommand（延迟命令在帧末 flush）。
+    app.update();
+    let cmd_tick = app
+        .world()
+        .get::<game_core::systems::AttackCommand>(proj_e)
+        .map(|c| c.tick);
+    assert_eq!(
+        cmd_tick,
+        Some(777),
+        "弹体伤害必须携带权威 SimTime.tick，而非写死 0"
+    );
+
+    // 第 2 帧起 damage_system 读到并结算伤害。
+    for _ in 0..4 {
         app.update();
     }
 
-    let hero = app.world().get::<Hero>(dummy).expect("dummy should have Hero");
+    let hero = app
+        .world()
+        .get::<Hero>(dummy)
+        .expect("dummy should have Hero");
     assert!(
         hero.health < 5000.0,
         "中立训练假人应被弹体命中掉血, health={}",
@@ -455,17 +546,22 @@ fn damage_emits_damage_dealt_event() {
     let attacker = app.world_mut().spawn((NetId(1),)).id();
     let target = app.world_mut().spawn((NetId(2),)).id();
 
-    app.world_mut()
-        .resource_mut::<DamageSink>()
-        .0
-        .push((attacker, target, 123.0, DamageType::Physical));
+    app.world_mut().resource_mut::<DamageSink>().0.push((
+        attacker,
+        target,
+        123.0,
+        DamageType::Physical,
+    ));
 
     app.add_systems(Update, flush_damage_events);
     app.update();
 
     let events = app.world().resource::<ServerEvents>();
     assert!(
-        events.0.iter().any(|e| matches!(e, GameEvent::DamageDealt { damage, .. } if *damage == 123.0)),
+        events
+            .0
+            .iter()
+            .any(|e| matches!(e, GameEvent::DamageDealt { damage, .. } if *damage == 123.0)),
         "服务端应向客户端广播 DamageDealt 事件"
     );
 }
@@ -508,7 +604,7 @@ fn full_server_connects_and_spawns_dummies() {
         for m in msgs {
             match m {
                 ServerMessage::Welcome { .. } => got_welcome = true,
-                ServerMessage::WorldSnapshot(_) => got_snapshot = true,
+                ServerMessage::Snapshot(_) | ServerMessage::WorldSnapshot(_) => got_snapshot = true,
                 ServerMessage::Event(GameEvent::HeroSpawn {
                     team: Team::Neutral,
                     ..

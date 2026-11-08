@@ -1,7 +1,7 @@
-//! 端到端移动链路测试：键盘输入 → handle_input → PlayerInputState → 客户端预测 →
-//! 上行 InputCmd → 服务端权威模拟 → 快照回传，验证本地英雄在 x/z 两轴都能移动。
+//! 端到端移动链路测试：方向键 / WASD → handle_input → PlayerInputState →
+//! 客户端预测 → 上行 InputCmd → 服务端权威模拟 → 快照回传，验证 x/z 两轴都能移动。
 //!
-//! 运行方式：cargo test -p client --test e2e_movement -- --nocapture
+//! 运行方式：cargo test -p gx-e2e --test e2e_movement -- --nocapture
 
 use bevy::prelude::*;
 use client::{
@@ -62,7 +62,9 @@ fn rehook_client_to_port(app: &mut App, port: u16) {
     app.insert_resource(client::networking::RenetClientResource(client));
     app.insert_resource(client::networking::ClientTransportResource(transport));
     app.insert_resource(client::networking::NetworkState::Connecting);
-    app.world_mut().resource_mut::<client::networking::ClientLobbyInfo>().my_net_id = None;
+    app.world_mut()
+        .resource_mut::<client::networking::ClientLobbyInfo>()
+        .my_net_id = None;
 }
 
 fn spawn_client_app() -> App {
@@ -123,13 +125,14 @@ fn move_dir(client: &App) -> Vec2 {
     client.world().resource::<PlayerInputState>().move_dir
 }
 
+/// 按下方向键 / WASD（headless 手工维护 ButtonInput<KeyCode>）。
 fn press_key(client: &mut App, key: KeyCode) {
-    let mut kb = ButtonInput::default();
+    let mut kb = ButtonInput::<KeyCode>::default();
     kb.press(key);
     client.insert_resource(kb);
 }
 
-fn release_key(client: &mut App) {
+fn release_keys(client: &mut App) {
     client.insert_resource(ButtonInput::<KeyCode>::default());
 }
 
@@ -145,7 +148,7 @@ fn run_frames(client: &mut App, server: &mut App, n: usize) -> (f32, f32) {
 }
 
 #[test]
-fn keyboard_w_moves_hero_in_z() {
+fn arrow_keys_move_hero_in_z() {
     let port = 5300;
     let mut server = spawn_server_app(port);
     let mut client = spawn_client_app();
@@ -155,40 +158,29 @@ fn keyboard_w_moves_hero_in_z() {
     let start = local_hero_pos(&mut client);
     eprintln!("hero start pos={:?}", start);
 
-    press_key(&mut client, KeyCode::KeyW);
-    // 先跑一帧确认 handle_input 产出了 move_dir
+    press_key(&mut client, KeyCode::ArrowUp);
     step_fixed(&mut server);
     step_fixed(&mut client);
-    let dir = move_dir(&mut client);
-    eprintln!("move_dir after W = {:?}", dir);
+    let dir = move_dir(&client);
+    eprintln!("move_dir after ArrowUp = {:?}", dir);
     assert!(
         dir.y < -0.5,
-        "W should produce -y move_dir (world -z，朝屏幕上方/远离相机), got {:?}",
-        dir
+        "ArrowUp should produce -y move_dir, got {dir:?}"
     );
 
     let (dx, dz) = run_frames(&mut client, &mut server, 60);
-    eprintln!("after 60 frames of W: dx={} dz={}", dx, dz);
-    assert!(
-        dz < -1.0,
-        "hero should move -Z (forward) under W: dz={}",
-        dz
-    );
+    eprintln!("after 60 frames of ArrowUp: dx={} dz={}", dx, dz);
+    assert!(dz < -1.0, "hero should move -Z: dz={}", dz);
 
-    // S 键应向 +Z（后退/靠近相机）
-    release_key(&mut client);
-    press_key(&mut client, KeyCode::KeyS);
+    press_key(&mut client, KeyCode::ArrowDown);
     let (dx2, dz2) = run_frames(&mut client, &mut server, 60);
-    eprintln!("after 60 frames of S: dx={} dz={}", dx2, dz2);
-    assert!(
-        dz2 > 1.0,
-        "hero should move +Z (backward) under S: dz={}",
-        dz2
-    );
+    eprintln!("after 60 frames of ArrowDown: dx={} dz={}", dx2, dz2);
+    assert!(dz2 > 1.0, "hero should move +Z: dz={}", dz2);
+    release_keys(&mut client);
 }
 
 #[test]
-fn keyboard_d_moves_hero_in_x() {
+fn wasd_moves_hero_in_x() {
     let port = 5301;
     let mut server = spawn_server_app(port);
     let mut client = spawn_client_app();
@@ -198,11 +190,8 @@ fn keyboard_d_moves_hero_in_x() {
     press_key(&mut client, KeyCode::KeyD);
     let (dx, dz) = run_frames(&mut client, &mut server, 60);
     eprintln!("after 60 frames of D: dx={} dz={}", dx, dz);
-    assert!(
-        dx > 1.0,
-        "hero should move +X (right) under D: dx={}",
-        dx
-    );
+    assert!(dx > 1.0, "hero should move +X: dx={}", dx);
+    release_keys(&mut client);
 }
 
 /// 复现真实客户端（main.rs 含 RenderingPlugin）启动时的 B0001 查询冲突崩溃。

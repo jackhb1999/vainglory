@@ -2,13 +2,11 @@
 //! 若预测不生效（比如本地英雄没拿到 LocalPlayer/Predicted），则“前后左右”全部失灵。
 
 use bevy::asset::AssetPlugin;
-use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
-use bevy::render::mesh::Mesh;
-use game_core::components::*;
 use client::input::PlayerInputState;
 use client::networking::ClientLobbyInfo;
 use client::prediction::PredictionPlugin;
+use game_core::components::*;
 
 fn build_client() -> App {
     let mut app = App::new();

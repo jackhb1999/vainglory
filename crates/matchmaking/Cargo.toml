@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "vainglory-mm"
+name = "gx-matchmaker"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,5 +16,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-redis = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

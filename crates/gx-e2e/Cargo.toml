@@ -1,0 +1,22 @@
+[package]
+name = "gx-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dev-dependencies]
+bevy = { workspace = true }
+bevy_egui = { workspace = true }
+renet2 = { workspace = true }
+renet2_netcode = { workspace = true }
+bitcode = { workspace = true }
+rand = { workspace = true }
+game-core = { path = "../game-core" }
+gx-net = { path = "../gx-net" }
+gx-config = { path = "../gx-config" }
+gx-proto-content = { path = "../gx-proto-content" }
+client = { path = "../client" }
+server = { path = "../server" }
+
+[lints]
+workspace = true

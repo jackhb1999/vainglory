@@ -7,14 +7,14 @@ use bevy::image::Image;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use bevy::render::mesh::Mesh;
-use game_core::components::*;
-use server::networking::{NetworkingPlugin as ServerNet, ServerPort};
-use server::simulation::SimulationPlugin as ServerSim;
-use server::spawn::SpawnPlugin as ServerSpawn;
-use server::ServerPlugin;
 use client::input::PlayerInputState;
 use client::networking::{ClientLobbyInfo, NetworkingPlugin as ClientNet, ReceivedSnapshot};
 use client::prediction::PredictionPlugin;
+use game_core::components::*;
+use server::ServerPlugin;
+use server::networking::{NetworkingPlugin as ServerNet, ServerPort};
+use server::simulation::SimulationPlugin as ServerSim;
+use server::spawn::SpawnPlugin as ServerSpawn;
 use std::time::Duration;
 
 fn main_app() -> (App, App) {
@@ -35,6 +35,10 @@ fn main_app() -> (App, App) {
     client
         .add_plugins(MinimalPlugins)
         .add_plugins(AssetPlugin::default())
+        // 状态机：连接只在对局状态建立（大厅不应偷偷连服务器），
+        // 因此 headless 客户端需显式进入 InMatch
+        .add_plugins(bevy::state::app::StatesPlugin)
+        .insert_state(client::AppState::InMatch)
         .add_plugins(ClientNet)
         .add_plugins(PredictionPlugin)
         .init_resource::<PlayerInputState>()
@@ -75,7 +79,7 @@ fn end_to_end_local_hero_moves() {
         client.update();
 
         // 查询客户端本地英雄
-        let mut world = client.world_mut();
+        let world = client.world_mut();
         let mut q = QueryState::<&Transform, With<LocalPlayer>>::new(world);
         for t in q.iter(world) {
             saw_local = true;
@@ -90,7 +94,10 @@ fn end_to_end_local_hero_moves() {
         "saw_local={}, start_z={:?}, end_z={:?}",
         saw_local, start_z, end_z
     );
-    assert!(saw_local, "客户端从未生成带 LocalPlayer 的本地英雄（is_local 逻辑疑似失效）");
+    assert!(
+        saw_local,
+        "客户端从未生成带 LocalPlayer 的本地英雄（is_local 逻辑疑似失效）"
+    );
     let (s, e) = (start_z.unwrap(), end_z.unwrap());
     assert!(
         (e - s).abs() > 0.5,
