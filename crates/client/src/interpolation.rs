@@ -14,23 +14,33 @@ use std::collections::{HashMap, HashSet, VecDeque};
 #[derive(Component)]
 struct ProjectileVisual;
 
+/// 死亡后「缩小消失」动画时长（秒）。服务端已 despawn 实体（碰撞体随之移除），
+/// 客户端仅据此延迟回收可视体并播放收缩动画，不回写任何裁决组件。
+pub const DYING_TIME: f32 = 0.4;
+
+/// 正在播放消失动画的实体（按 `NetId`），值为剩余秒数。纯表现层延迟回收。
+#[derive(Resource, Default)]
+pub struct DyingMinions(pub std::collections::HashMap<NetId, f32>);
+
 pub struct InterpolationPlugin;
 
 impl Plugin for InterpolationPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<EntityHistory>().add_systems(
-            FixedUpdate,
-            (
-                sync_projectiles,
-                sync_minions,
-                crate::entity_visual::sync_monsters,
-                store_snapshot_history,
-                interpolate_entities,
-                sync_hero_stats,
-                crate::entity_visual::tick_non_hero_anim,
-            )
-                .chain(),
-        );
+        app.init_resource::<EntityHistory>()
+            .init_resource::<DyingMinions>()
+            .add_systems(
+                FixedUpdate,
+                (
+                    sync_projectiles,
+                    sync_minions,
+                    crate::entity_visual::sync_monsters,
+                    store_snapshot_history,
+                    interpolate_entities,
+                    sync_hero_stats,
+                    crate::entity_visual::tick_non_hero_anim,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -143,7 +153,14 @@ fn sync_projectiles(
 }
 
 /// 根据快照创建 / 回收小兵可视化实体。
+/// 敌人死亡判定：实体从快照视野消失（`!seen`）且尚未进入消失动画时，
+/// 应登记为缩小消失动画（而非立即移除）。抽成纯函数便于单测锁定不变量。
+pub fn should_start_dying(seen: &HashSet<NetId>, nid: NetId, dying: &DyingMinions) -> bool {
+    !seen.contains(&nid) && !dying.0.contains_key(&nid)
+}
+
 /// 小兵只在视野内出现在快照中，因此“消失”时直接回收即可。
+#[allow(clippy::too_many_arguments)]
 fn sync_minions(
     snapshot: Option<Res<ReceivedSnapshot>>,
     mut commands: Commands,
@@ -151,6 +168,9 @@ fn sync_minions(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     existing: Query<(Entity, &NetId), With<MinionVisual>>,
+    time: Res<Time>,
+    mut transforms: Query<&mut Transform>,
+    mut dying: ResMut<DyingMinions>,
 ) {
     let Some(snapshot) = snapshot else { return };
     if snapshot.0.tick == 0 {
@@ -185,12 +205,35 @@ fn sync_minions(
             TransformSync::default(),
             Interpolated,
             MinionVisual,
+            // 让小兵可被点击锁定（之前缺此组件，右键锁定查询只匹配到英雄）。
+            Selectable {
+                radius: 0.8,
+                height: 2.0,
+            },
         ));
     }
 
-    for (nid, e) in existing_map {
-        if !seen.contains(&nid) {
-            commands.entity(e).despawn();
+    let dt = time.delta_secs();
+    for (nid, e) in existing_map.iter() {
+        if let Some(timer) = dying.0.get_mut(nid) {
+            // 死亡后缩小消失动画（服务端已 despawn，碰撞体移除）。
+            if let Ok(mut t) = transforms.get_mut(*e) {
+                let k = (*timer / DYING_TIME).clamp(0.02, 1.0);
+                t.scale = Vec3::splat(k);
+            }
+            *timer -= dt;
+            if *timer <= 0.0 {
+                dying.0.remove(nid);
+                commands.entity(*e).despawn();
+            }
+            continue;
+        }
+        if !seen.contains(nid) {
+            // 实体从快照消失（服务端已 despawn，碰撞体随之移除）：触发缩小消失动画，
+            // 而非立即移除，避免「只隐藏血条、实体仍占位」的观感。
+            if should_start_dying(&seen, *nid, &dying) {
+                dying.0.insert(*nid, DYING_TIME);
+            }
         }
     }
 }
@@ -257,5 +300,36 @@ fn sync_hero_stats(
         if let Some(mut abilities) = abilities {
             abilities.cooldowns = es.ability_cooldowns;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn minion_disappearance_triggers_dying_animation() {
+        let mut seen = HashSet::new();
+        seen.insert(NetId(1));
+        let dying = DyingMinions::default();
+
+        // 视野内仍可见的实体不应触发消失动画
+        assert!(
+            !should_start_dying(&seen, NetId(1), &dying),
+            "可见实体不应进入消失动画"
+        );
+        // 从快照消失且尚未动画的实体应触发
+        assert!(
+            should_start_dying(&seen, NetId(2), &dying),
+            "消失的实体应进入消失动画"
+        );
+        // 已处于消失动画的实体不重复登记
+        let mut dying2 = DyingMinions::default();
+        dying2.0.insert(NetId(2), 0.4);
+        assert!(
+            !should_start_dying(&seen, NetId(2), &dying2),
+            "已动画实体不应重复登记"
+        );
     }
 }

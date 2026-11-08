@@ -774,7 +774,14 @@ fn handle_game_event(
         GameEvent::TurretDestroyed { .. } => {
             push_fx(voxel::PixelKind::Stone, FxShape::Orb, Vec3::ZERO, 8, 83);
         }
-        GameEvent::JungleMonsterDeath { .. } | GameEvent::AbyssWardenDeath { .. } => {
+        GameEvent::MinionDeath { .. } => {
+            // 消失动画由 `sync_minions` 依据快照中该小兵消失来触发（避免给 receive_server_messages 增参数）。
+            push_fx(voxel::PixelKind::Brush, FxShape::Orb, Vec3::ZERO, 4, 84);
+        }
+        GameEvent::JungleMonsterDeath { .. } => {
+            push_fx(voxel::PixelKind::Brush, FxShape::Orb, Vec3::ZERO, 6, 84);
+        }
+        GameEvent::AbyssWardenDeath { .. } => {
             push_fx(voxel::PixelKind::Brush, FxShape::Orb, Vec3::ZERO, 6, 84);
         }
         GameEvent::LodeShrineCapture { team }

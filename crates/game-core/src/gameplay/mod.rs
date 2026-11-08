@@ -81,6 +81,14 @@ pub enum NetEvent {
         net_id: u64,
         team: Team,
     },
+    /// 小兵死亡：服务端已 despawn（碰撞体移除），仅需告知客户端播放消失动画。
+    MinionDeath {
+        net_id: u64,
+    },
+    /// 野怪死亡：同上，并触发客户端特效。
+    JungleMonsterDeath {
+        net_id: u64,
+    },
 }
 
 /// 玩法关键事件汇：内部裁决记录 + 待广播的协议事件。

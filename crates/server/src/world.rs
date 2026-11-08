@@ -251,7 +251,9 @@ pub fn minion_ai_system(
         }
 
         let dir = ai.step(Vec2::new(pos.x, pos.z), dt);
-        let velocity = Vec3::new(dir.x, 0.0, dir.y) * ai.move_speed;
+        // 河道减速（视觉已由水面区分），与英雄共用同一地形系数。
+        let speed = ai.move_speed * game_core::map::terrain_speed_mult(transform.translation);
+        let velocity = Vec3::new(dir.x, 0.0, dir.y) * speed;
         transform.translation += velocity * dt;
         sync.position = transform.translation;
         sync.velocity = velocity;
@@ -323,7 +325,7 @@ pub fn world_damage_system(
             continue;
         }
 
-        if let Ok((mut minion, _nid)) = minions.get_mut(cmd.target) {
+        if let Ok((mut minion, nid)) = minions.get_mut(cmd.target) {
             let dealt = raw * 100.0 / (100.0 + minion.armor.max(0.0));
             minion.health = (minion.health - dealt).max(0.0);
             if minion.health <= combat::EPS {
@@ -332,12 +334,14 @@ pub fn world_damage_system(
                     attacker_hero.experience =
                         attacker_hero.experience.saturating_add(minion.exp_reward);
                 }
+                // 广播死亡：客户端据此播放消失动画；服务端已 despawn（碰撞体随之移除）。
+                events.emit(NetEvent::MinionDeath { net_id: nid.0 });
                 commands.entity(cmd.target).despawn();
             }
             continue;
         }
 
-        if let Ok((mut monster, _nid)) = monsters.get_mut(cmd.target) {
+        if let Ok((mut monster, nid)) = monsters.get_mut(cmd.target) {
             let dealt = raw * 100.0 / (100.0 + monster.armor.max(0.0));
             monster.health = (monster.health - dealt).max(0.0);
             if monster.health <= combat::EPS {
@@ -346,6 +350,7 @@ pub fn world_damage_system(
                     attacker_hero.experience =
                         attacker_hero.experience.saturating_add(monster.exp_reward);
                 }
+                events.emit(NetEvent::JungleMonsterDeath { net_id: nid.0 });
                 commands.entity(cmd.target).despawn();
             }
         }

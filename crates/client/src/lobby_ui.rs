@@ -153,7 +153,14 @@ fn draw_mode_column(
     );
     ui.add_space(16.0);
     heading(ui, t(lang, "操作提示", "CONTROLS"));
-    muted(ui, t(lang, "WASD / 方向键  移动", "WASD / ARROWS  move"));
+    muted(
+        ui,
+        t(
+            lang,
+            "左键点击地面 移动（自动寻路）· WASD/方向键 直接移动",
+            "LMB click ground to move · WASD/Arrows also move",
+        ),
+    );
     muted(ui, t(lang, "右键  锁定普攻", "RMB  attack"));
     muted(ui, t(lang, "Q / E / R / F  技能", "Q / E / R / F  skills"));
     muted(ui, t(lang, "P  商店 · B  回城", "P  shop · B  recall"));

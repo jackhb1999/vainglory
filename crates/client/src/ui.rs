@@ -333,9 +333,9 @@ fn draw_lobby(
                 egui::pos2(screen.center().x, screen.top() + h * 0.845),
                 egui::Align2::CENTER_CENTER,
                 if zh {
-                    "WASD / 方向键 移动 · 右键锁定攻击 · Q/E/R/F 技能 · P 商店"
+                    "左键点击地面移动 · WASD/方向键也移动 · 右键锁定攻击 · Q/E/R/F 技能 · P 商店"
                 } else {
-                    "WASD move - RMB attack - Q/E/R/F skills - P shop"
+                    "LMB click: move - WASD: move - RMB: lock - Q/E/R/F skills - P shop"
                 },
                 egui::FontId::proportional(14.0),
                 egui::Color32::from_rgb(130, 145, 170),

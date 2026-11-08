@@ -6,7 +6,7 @@
 
 use crate::networking::{EventCursor, ServerEvents};
 use bevy::prelude::*;
-use game_core::components::NetId;
+use game_core::components::{NetId, Team};
 use game_core::gameplay::{GameplayEvents, NetEvent};
 use game_core::net::GameEvent;
 
@@ -120,6 +120,15 @@ pub fn drain_gameplay_events(
                 net_id: NetId(net_id),
                 destroyer: NetId(0),
                 team,
+            },
+            NetEvent::MinionDeath { net_id } => GameEvent::MinionDeath {
+                net_id: NetId(net_id),
+                killer: None,
+            },
+            NetEvent::JungleMonsterDeath { net_id } => GameEvent::JungleMonsterDeath {
+                net_id: NetId(net_id),
+                killer: NetId(0),
+                team: Team::Neutral,
             },
         };
         out.0.push(game_event);

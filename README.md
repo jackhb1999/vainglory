@@ -147,6 +147,20 @@ cargo run -p matchmaking
 
 **大厅与对局场景解耦**：启动期只生成「承载 egui 主上下文的相机 + 灯光」（`spawn_game_scene`），**不生成任何游戏世界内容**；体素地形 / 哨塔 / 源核 / 各类标记改由 `OnEnter(AppState::InMatch)` 的 `spawn_match_world` 生成。因此大厅阶段后景是空 3D 场景（由全屏 `Window` 完全覆盖），玩家点「进入对局」后才开始渲染地形与实体，消除「大厅是个弹窗、后景是对局」的观感。护栏单测 `lobby_startup_renders_only_camera_not_match_world` 锁定此不变量。
 
+### 6.5 战斗体验修复（P-U2）
+
+针对「敌人死亡只隐藏血条 / 河道桥面无差异 / 小兵不可锁定 / 普攻存疑 / 经济重复发奖」五项缺陷，本轮的当前实现与修复：
+
+| # | 缺陷 | 当前实现（修复前） | 修复方案 | 位置 | 验证 |
+|---|---|---|---|---|---|
+| 1 | 敌人死亡应消失 / 播动画并移除碰撞体 | 小兵/野怪死亡后服务端 `despawn`，但客户端缺「消失动画」资源，仅从快照消失（看似瞬间消失）；英雄死亡走 `HeroDeath` 不 despawn（正确） | 新增 `DyingMinions` 资源 + `DYING_TIME=0.4s`；`sync_minions` / `sync_monsters` 检测「快照中实体消失」即登记为缩小消失动画，按 `scale = 剩余/0.4` 收缩、计时结束 `despawn`（碰撞体随之移除）。服务端 `world.rs` 同时广播 `NetEvent::MinionDeath/JungleMonsterDeath` → 客户端 `GameEvent`（野怪额外触发碎裂特效） | `client/interpolation.rs`、`client/entity_visual.rs`、`server/world.rs`、`game-core/gameplay/mod.rs`、`server/net_bridge.rs` | `should_start_dying` 单测；e2e `gameplay_systems_drive_a_full_ecs_match_slice` 死亡/重生断言 |
+| 2 | 河道与桥面不同移动效果 | 地图仅有 `PixelKind::Water` 水面视觉，无任何移动惩罚 | 新增 `terrain_speed_mult(pos)`：河道带 `\|x\|≤RIVER_HALF_WIDTH` 减速为 0.5；兵线穿越河道的「桥面」（`\|z+84\|≤6`）保持全速——即**河道浅滩减速、桥面全速**的差异化；仅改速度，不改裁决平面、不阻挡通行。英雄（`systems.rs`）与小兵 AI（`world.rs`）移动均乘该系数 | `game-core/map.rs`、`systems.rs`、`world.rs` | `river_slows_movement_but_bridge_is_full_speed` 单测 |
+| 3 | 小兵可锁定与攻击 | 客户端小兵可视实体**缺 `Selectable`**，右键锁定查询只命中英雄，无法选中/锁定小兵 | 小兵 `MinionVisual` 生成时补挂 `Selectable{radius:0.8,height:2.0}`；右键锁定改为遍历所有 `Selectable`（含小兵）取最近目标。`world.rs` 的攻击系统本就处理小兵/野怪目标并结算 `gold_reward/exp_reward` | `client/interpolation.rs`、`client/input.rs`、`server/world.rs` | 结构校验 + e2e 小兵击杀金币 |
+| 4 | 英雄普攻是否存在且生效 | `attack_system` 持续置位普攻意图 → `AttackCommand` → `damage_system` 对英雄/小兵/野怪结算伤害；英雄致死走 `HeroDeath` | 确认普攻链路完整：e2e 中以 1000 伤害 `AttackCommand` 击杀英雄，断言 `health=0`、`RespawnState.dead`、`GameplayEvents::deaths` 含 killer/victim | `game-core/systems.rs`、`server/world.rs`、`server/gameplay.rs` | e2e 致命攻击断言 |
+| 5 | 经济：来源/显示/消费 | 英雄击杀时**重复发奖**：`systems.rs` 即时 `+50 金币/+100 经验` 与 `kill_bounty`（基础 180+连杀）叠加 | 移除即时 `+50/+100`，击杀奖励统一由 `death_respawn_system` 经 `kill_bounty` 结算。来源 = 被动 1.3/s（`passive_gold_system`）+ 击杀英雄 `kill_bounty` + 击杀小兵/野怪 `gold_reward`；显示 = HUD 金币；消费 = 商店购买/售出（`P-U1` 已贯通） | `game-core/systems.rs`、`server/gameplay.rs`、`game-core/systems.rs`、`client/ui.rs` | e2e 金币断言由 930 修正为 **880**（1000+180−300） |
+
+**已知限制 / 后续**：消失动画依赖「快照中实体消失」判定，在极端视锥裁剪下可能与真实死亡偶发混淆（小地图全可见场景无碍）；野怪死亡目前仅客户端特效，未做额外桥面网格（桥面以兵线穿越点全速带表示）。
+
 ## 7. M1 实现要点
 
 - **协议**：`PROTOCOL_VERSION = 3`（v3 在 v2 基础上新增 `CH_STATUS` / `CH_SHIELD` 快照位、9 类玩法事件、购买 / 售出上行；bitcode 与 v2 不兼容，由 `negotiate` 拒绝旧端）+ `config_hash` 双版本协商，不匹配时明确 `Reject`，不静默降级。

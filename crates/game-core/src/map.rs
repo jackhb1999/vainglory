@@ -257,3 +257,56 @@ pub fn fold_line_endpoints() -> (Vec3, Vec3) {
 pub const HERO_SIGHT_RANGE: f32 = 14.0;
 pub const WARD_SIGHT_RANGE: f32 = 10.0;
 pub const TURRET_SIGHT_RANGE: f32 = 16.0;
+
+/// 桥面：河道带内兵线穿越河道的全速通行区（`THE_LANE` 在 `z = -84` 处跨越 `x = 0`）。
+/// 单位在此不减速，与河道浅滩形成差异化移动效果。
+pub const BRIDGE_Z: f32 = -84.0;
+pub const BRIDGE_HALF_LEN: f32 = 6.0;
+
+/// 河道移动系数：沿 `x = 0` 南北贯穿的浅滩带（`|x| ≤ RIVER_HALF_WIDTH`）减速为一半，
+/// 但兵线穿越河道的「桥面」（`|x| ≤ RIVER_HALF_WIDTH` 且 `|z - BRIDGE_Z| ≤ BRIDGE_HALF_LEN`）
+/// 保持全速——即**河道浅滩减速、桥面全速**的差异化移动效果。
+/// **仅影响移动速度**，不改裁决平面（y=0）、不阻挡通行、不提供碰撞豁免。
+/// 视觉区分：河道为水面（`PixelKind::Water`），桥面为兵线穿越点。
+pub fn terrain_speed_mult(pos: Vec3) -> f32 {
+    if pos.x.abs() <= RIVER_HALF_WIDTH {
+        if (pos.z - BRIDGE_Z).abs() <= BRIDGE_HALF_LEN {
+            1.0 // 桥面：全速通行
+        } else {
+            0.5 // 河道浅滩：减速一半
+        }
+    } else {
+        1.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn river_slows_movement_but_bridge_is_full_speed() {
+        // 河道浅滩（非桥面）减速一半
+        assert_eq!(terrain_speed_mult(Vec3::new(0.0, 0.0, 30.0)), 0.5);
+        assert_eq!(
+            terrain_speed_mult(Vec3::new(RIVER_HALF_WIDTH, 0.0, 0.0)),
+            0.5
+        );
+        // 桥面（兵线穿越点）保持全速
+        assert_eq!(terrain_speed_mult(Vec3::new(0.0, 0.0, BRIDGE_Z)), 1.0);
+        assert_eq!(
+            terrain_speed_mult(Vec3::new(RIVER_HALF_WIDTH, 0.0, BRIDGE_Z + BRIDGE_HALF_LEN)),
+            1.0
+        );
+        // 河道带外、桥面边界外均全速
+        assert_eq!(
+            terrain_speed_mult(Vec3::new(RIVER_HALF_WIDTH + 0.01, 0.0, 0.0)),
+            1.0
+        );
+        assert_eq!(
+            terrain_speed_mult(Vec3::new(0.0, 0.0, BRIDGE_Z + BRIDGE_HALF_LEN + 0.01)),
+            0.5
+        );
+        assert_eq!(terrain_speed_mult(Vec3::new(40.0, 0.0, 40.0)), 1.0);
+    }
+}

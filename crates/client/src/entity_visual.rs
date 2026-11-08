@@ -6,6 +6,7 @@
 //! - 动画只改骨架子节点的 `Transform`，不触碰裁决 / 同步组件；
 //! - 全部几何、材质经 `VoxelMaterialPool` 或 `voxel::voxel_material` 代码生成，零外部资产。
 
+use crate::interpolation::{DYING_TIME, DyingMinions};
 use crate::networking::ReceivedSnapshot;
 use crate::voxel::{self, PixelKind};
 use bevy::image::Image;
@@ -153,6 +154,9 @@ pub fn sync_monsters(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     existing: Query<(Entity, &NetId), With<MonsterVisual>>,
+    time: Res<Time>,
+    mut transforms: Query<&mut Transform>,
+    mut dying: ResMut<DyingMinions>,
 ) {
     let Some(snapshot) = snapshot else { return };
     if snapshot.0.tick == 0 {
@@ -187,9 +191,26 @@ pub fn sync_monsters(
             MonsterVisual,
         ));
     }
-    for (nid, e) in existing_map {
-        if !seen.contains(&nid) {
-            commands.entity(e).despawn();
+    let dt = time.delta_secs();
+    for (nid, e) in existing_map.iter() {
+        if let Some(timer) = dying.0.get_mut(nid) {
+            // 死亡后缩小消失动画（服务端已 despawn，碰撞体移除）。
+            if let Ok(mut t) = transforms.get_mut(*e) {
+                let k = (*timer / DYING_TIME).clamp(0.02, 1.0);
+                t.scale = Vec3::splat(k);
+            }
+            *timer -= dt;
+            if *timer <= 0.0 {
+                dying.0.remove(nid);
+                commands.entity(*e).despawn();
+            }
+            continue;
+        }
+        if !seen.contains(nid) {
+            // 从快照消失（服务端已 despawn）：触发缩小消失动画而非立即移除。
+            if !dying.0.contains_key(nid) {
+                dying.0.insert(*nid, DYING_TIME);
+            }
         }
     }
 }

@@ -138,7 +138,9 @@ pub fn movement_system(
     for (mut transform, mut sync, hero, input) in query.iter_mut() {
         if input.move_dir != Vec2::ZERO {
             let direction = Vec3::new(input.move_dir.x, 0.0, input.move_dir.y).normalize();
-            let velocity = direction * hero.move_speed;
+            // 河道（|x| ≤ RIVER_HALF_WIDTH）减速为一半；仅影响速度，不改裁决平面。
+            let speed = hero.move_speed * crate::map::terrain_speed_mult(transform.translation);
+            let velocity = direction * speed;
 
             transform.translation += velocity * dt;
             // 限制英雄在地图边界内，避免跑出地图
@@ -383,12 +385,8 @@ pub fn damage_system(
             let has_respawn = respawn_state.is_some();
             let victim_id = target_net_id.map(|n| n.0).unwrap_or(0);
             if lethal {
-                // 击杀奖励（保留旧值避免回归；连杀赏金由 gameplay 系统追加）
-                if let Ok(attacker_row) = targets.get_mut(cmd.attacker) {
-                    let mut attacker_hero = attacker_row.0;
-                    attacker_hero.gold += 50;
-                    attacker_hero.experience += 100;
-                }
+                // 击杀奖励由服务端 `death_respawn_system` 统一经 `kill_bounty`
+                // （基础 180 + 连杀加成）结算给击杀者，这里不再额外发奖，避免双重发放。
                 if let Some(pending) = pending_deaths.as_deref_mut() {
                     pending.0.push((cmd.tick, killer_id, victim_id));
                 }

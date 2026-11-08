@@ -183,9 +183,10 @@ fn gameplay_systems_drive_a_full_ecs_match_slice() {
         assert!(world.get::<respawn::RespawnState>(victim).unwrap().dead);
 
         // 商店事务：扣 300 金币、+12 AD、占用一个栏位。
-        // 起始 1000 + 击杀奖励 50 + 连杀赏金 180 - 装备 300 = 930
+        // 击杀奖励统一由 `kill_bounty`（基础 180 + 连杀加成）结算，不再有额外的 +50 即时奖励，
+        // 故 起始 1000 + 连杀赏金 180 - 装备 300 = 880（修复此前 +50/+100 双重发奖）。
         let hero = world.get::<Hero>(attacker).unwrap();
-        assert_eq!(hero.gold, 930);
+        assert_eq!(hero.gold, 880);
         assert_eq!(hero.attack_damage, 60.0 + 12.0);
         let inv = world.get::<shop::Inventory>(attacker).unwrap();
         assert_eq!(inv.slots[0].as_deref(), Some("item_edge_shard"));

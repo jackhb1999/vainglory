@@ -508,7 +508,9 @@ fn update_egui_input(mut contexts: EguiContexts, input_state: Res<PlayerInputSta
             input_state.aim_dir.x, input_state.aim_dir.y
         ));
         ui.label(format!("Ability Mask: {:04b}", input_state.ability_mask));
-        ui.label("WASD/Arrows: move | LMB: path | RMB: move/lock | Q/E/R/F: skills");
+        ui.label(
+            "LMB click: move(path) | WASD/Arrows: move(prio) | RMB: lock/aim | Q/E/R/F: skills",
+        );
     });
 }
 
