@@ -11,7 +11,7 @@
 
 > 本文所有"现状"描述均来自对 `crates/**` 的只读盘点；所有"目标"描述为设计，尚未实现。开发注意项（§14）是本项目的**强制工程约束**，其中多条来自本仓库已实际发生的故障。
 
-> **文档族（GX-01）**：本文档与下列文档共享同一套 ID 前缀（`TA`/`TF`/`ADR`/`ARC`/`FR`/`NFR`/`CR`/`UC`/`DEV`/`TC`/`GAP`/`DN`/`TR`），禁止各自另起编号；术语以本文 §2.1 为准。
+> **文档族（GX-01；游戏名《虚无荣耀》）**：本文档与下列文档共享同一套 ID 前缀（`TA`/`TF`/`ADR`/`ARC`/`FR`/`NFR`/`CR`/`UC`/`DEV`/`TC`/`GAP`/`DN`/`TR`），禁止各自另起编号；术语以本文 §2.1 为准。
 >
 > | 文档 | 编号 | 文件 |
 > |---|---|---|
@@ -21,6 +21,7 @@
 > | 开发实施 | `GX-DEV-2026-001` | `docs/04_DEVELOPMENT.md` |
 > | 对战详细规格 | `GX-CBT-2026-001` | `docs/05_COMBAT_SPEC.md` |
 > | 表现层规范 | `GX-VIS-2026-001` | `docs/06_VISUAL_SPEC.md` |
+> | 开发进度与状态 | `GX-PROG-2026-001` | `docs/07_PROGRESS.md` |
 > | 上游可行性研究（合规留档，非本项目原创内容） | `VG-FS-2026-001` | `docs/VAINGLORY_FEASIBILITY_STUDY.md` |
 > | 资产登记 | `GX-ASSET-REG-2026-001` | `ASSET_REGISTRY.md` |
 > | 表达层禁用词 | — | `docs/TERM_DENYLIST.txt` |

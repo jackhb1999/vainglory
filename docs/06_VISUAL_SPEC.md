@@ -4,14 +4,14 @@
 |---|---|
 | 文档编号 | `GX-VIS-2026-001` |
 | 版本 | v1.0（P-V0 口径收口） |
-| 关联 | `PRES-1~9` / `GX-CBT-2026-001` §16 / `ASSET_REGISTRY.md` / `README.md` §8 |
+| 关联 | `PRES-1~9` / `GX-CBT-2026-001` §16 / `ASSET_REGISTRY.md` / `docs/07_PROGRESS.md` §4 |
 | 适用范围 | `client` crate 全部表现层资产：几何、纹理、材质、特效、动画、HUD 标记 |
 | 硬约束 | **零外部资产**，全部代码生成；`docs/**` 与 `LEGAL/**` 为术语白名单，其余发布树受合规门禁扫描 |
 
 > 本文是 P-V0 的交付物，也是 P-V1 / P-V2 / P-V3 的**唯一口径来源**。
 > 后续阶段若发现与本规范冲突，必须先修订本规范并同步 `README.md` / §16 / 资产登记表，再继续实现。
 
-> **文档族（GX-01）**：本文档与下列文档共享同一套 ID 前缀（`FR`/`NFR`/`CR`/`UC`/`DEV`/`TC`/`GAP`/`ARC`/`ADR`/`TA`/`TF`/`DN`/`TR`），禁止各自另起编号；术语以 `docs/02_ARCHITECTURE.md` §2.1 为准。
+> **文档族（GX-01；游戏名《虚无荣耀》）**：本文档与下列文档共享同一套 ID 前缀（`FR`/`NFR`/`CR`/`UC`/`DEV`/`TC`/`GAP`/`ARC`/`ADR`/`TA`/`TF`/`DN`/`TR`），禁止各自另起编号；术语以 `docs/02_ARCHITECTURE.md` §2.1 为准。
 >
 > | 文档 | 编号 | 文件 |
 > |---|---|---|
@@ -21,6 +21,7 @@
 > | 开发实施 | `GX-DEV-2026-001` | `docs/04_DEVELOPMENT.md` |
 > | 对战详细规格 | `GX-CBT-2026-001` | `docs/05_COMBAT_SPEC.md` |
 > | 表现层规范 | `GX-VIS-2026-001` | `docs/06_VISUAL_SPEC.md` |
+> | 开发进度与状态 | `GX-PROG-2026-001` | `docs/07_PROGRESS.md` |
 > | 上游可行性研究（合规留档，非本项目原创内容） | `VG-FS-2026-001` | `docs/VAINGLORY_FEASIBILITY_STUDY.md` |
 > | 资产登记 | `GX-ASSET-REG-2026-001` | `ASSET_REGISTRY.md` |
 > | 表达层禁用词 | — | `docs/TERM_DENYLIST.txt` |
@@ -546,7 +547,7 @@ P-V0 不改动运行时行为，只把「视觉方向、美术风格、色彩规
 
 | 编号 | 冲突 | 处置 |
 |---|---|---|
-| A-05 | 前四阶段资产表 / `README.md` §8.6 / `docs/05_COMBAT_SPEC.md` §16.4 均写「8-bit 音频零实现 / 待资产」，本阶段变为**已提供** | 单一 `ASSET_REGISTRY.md`、README、§16 全部回写；**门禁要求的「待资产 / 外部依赖」标注仍由 A-006 中文字形条目承担**，不删除、不放宽 |
+| A-05 | 前四阶段资产表 / `docs/07_PROGRESS.md` §4.6 / `docs/05_COMBAT_SPEC.md` §16.4 均写「8-bit 音频零实现 / 待资产」，本阶段变为**已提供** | 单一 `ASSET_REGISTRY.md`、`README.md` / `docs/07_PROGRESS.md`、§16 全部回写；**门禁要求的「待资产 / 外部依赖」标注仍由 A-006 中文字形条目承担**，不删除、不放宽 |
 | A-06 | §16.1 PRES-7 与资产表写「当前无高度层与河道，`PixelKind::Water` 已定义未启用」 | 本阶段启用河道与 7 层高度表，逐处回写；`Water` 从「定义未启用」变为「河道水面」 |
 | A-07 | §11.2.4 明确「高频事件刻意不生成世界空间特效」，音频若逐事件发声会违反同一性能意图 | 音频采用**稀疏显式映射表**（`SFX_EVENT_MAP`），野怪死亡 / 波次 / 状态等高频事件不发声；视觉与听觉共用同一次事件消费 |
 | A-08 | §7 性能预算只覆盖视觉实体 | 新增音频预算：单帧 ≤4 次播放、单音效 ≤0.5 s、采样率 22.05 kHz 单声道、内存 PCM；静态发布包仍无音频二进制 |
@@ -767,7 +768,7 @@ P-V0 不改动运行时行为，只把「视觉方向、美术风格、色彩规
 | 编号 | 冲突 | 处置 |
 |---|---|---|
 | A-09 | P-V0 的 `draw_lobby` 用 `egui::Area` + 手绘 painter 画**静态示意图**，只有一行不可点的模式文字、3 张硬编码英雄卡、一个进入按钮；用户实测「刚进入没有大厅」 | 保留 `AppState` 默认 `Lobby` 与 `OnEnter(InMatch)` 延后连接（不改流程），把大厅换成**锁定视口的顶层 `Window` + 三列布局**；旧函数归档不注册。egui 0.36 的 `CentralPanel::show` 只接受 `&mut Ui`（嵌套语义），顶层必须用 `Window::show(ctx, ..)` |
-| A-10 | `README.md` §6.1 长期写「大厅与流程 = `draw_lobby` 全屏入口」，与重构后不符 | 更新该行并新增 `README.md` §6.4 完整说明；§6.1 其余历史描述保留为设计依据 |
+| A-10 | `docs/07_PROGRESS.md` §2.1 长期写「大厅与流程 = `draw_lobby` 全屏入口」，与重构后不符 | 更新该行并新增 `docs/07_PROGRESS.md` §2.4 完整说明；§6.1 其余历史描述保留为设计依据 |
 | A-11 | 商店协议链（`PurchaseItem` / `SellItem` → `try_buy` / `try_sell` → `ItemPurchased` 等）早已闭环，但客户端**从未发送**，`README` 与 §16 均标为未完成 | 客户端补 `ClientCommandQueue → send_client_commands` 唯一发送入口；文档状态回写。**不改服务端裁决**：距离 / 阵亡 / tick / 返还 / 栏位仍全部由服务端重算 |
 | A-12 | `MatchMode::{Pve, Pvp}` 枚举与 PVE bot AI 已实现，但 `Pvp` 从未被赋值，`handle_state_transitions` 恒为「≥1 人即 Running」 | 新增 `ClientMessage::SelectMode`（末尾追加变体，`PROTOCOL_VERSION` 与 `content_digest()` 不变）；服务端只在 `MatchPhase::Warmup` 接受；`required_players()` 规定 PVP 需 2 名真人；`ensure_pve_bot` 依据 `MatchClock.mode` 天然跳过 PVP |
 | A-13 | 时序竞争：`ensure_pve_bot` 在 `FixedUpdate` 按默认 PVE 判断，若模式消息晚于首个玩家连接，AI 会在切到 PVP 前被生成 | `SelectMode` 与 `Hello` **同批** `ReliableOrdered` 上行；服务端 `handle_session_messages`（认证前）与 `handle_gameplay_messages`（认证后 / 重连）两处都能处理，覆盖三种到达时机 |

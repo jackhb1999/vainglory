@@ -299,7 +299,7 @@ pub fn verify_replay(path: &Path) -> Result<ReplayDiff, ReplayError>;
 - `--no-default-features`，确认 `dev-tools`、`offline-dev` 未启用；
 - 包体不包含 `LEGAL/`、第三方数据目录、遥测样本、`docs/` 合规留档；
 - 表现层全部代码生成、零外部资源路径；音频若引入须登记许可；
-- 窗口标题、包名、二进制名、描述均为 GX-01 代号或最终产品名；
+- 窗口标题、包名、二进制名、描述均为 GX-01 代号或最终产品名《虚无荣耀》；
 - 禁词扫描对**发布包**再跑一次（不只是源码）。
 
 ---

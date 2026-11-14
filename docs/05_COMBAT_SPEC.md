@@ -14,7 +14,7 @@
 >
 > **数值声明**：本文全部数值为**本项目自研占位值**，用于让一局对战能完整跑通与验证，不作为上线平衡数值。按 `AS-04` / `GX-PRD-2026-001` §11.1 标注为外部依赖（需 M2 平衡验证回填）。
 
-> **文档族（GX-01）**：本文档与下列文档共享同一套 ID 前缀（`FR`/`NFR`/`CR`/`UC`/`DEV`/`TC`/`GAP`/`ARC`/`ADR`/`TA`/`TF`/`DN`/`TR`），禁止各自另起编号；术语以 `docs/02_ARCHITECTURE.md` §2.1 为准。
+> **文档族（GX-01；游戏名《虚无荣耀》）**：本文档与下列文档共享同一套 ID 前缀（`FR`/`NFR`/`CR`/`UC`/`DEV`/`TC`/`GAP`/`ARC`/`ADR`/`TA`/`TF`/`DN`/`TR`），禁止各自另起编号；术语以 `docs/02_ARCHITECTURE.md` §2.1 为准。
 >
 > | 文档 | 编号 | 文件 |
 > |---|---|---|
@@ -24,6 +24,7 @@
 > | 开发实施 | `GX-DEV-2026-001` | `docs/04_DEVELOPMENT.md` |
 > | 对战详细规格 | `GX-CBT-2026-001` | `docs/05_COMBAT_SPEC.md` |
 > | 表现层规范 | `GX-VIS-2026-001` | `docs/06_VISUAL_SPEC.md` |
+> | 开发进度与状态 | `GX-PROG-2026-001` | `docs/07_PROGRESS.md` |
 > | 上游可行性研究（合规留档，非本项目原创内容） | `VG-FS-2026-001` | `docs/VAINGLORY_FEASIBILITY_STUDY.md` |
 > | 资产登记 | `GX-ASSET-REG-2026-001` | `ASSET_REGISTRY.md` |
 > | 表达层禁用词 | — | `docs/TERM_DENYLIST.txt` |
@@ -700,7 +701,7 @@ respawn_ticks = (8 + 2 * (level - 1)) * 60, clamp(..., 480, 2400)   // 8~40 s
 ## 16. 表现层规范（程序化 / 零外部资源）
 
 > 本节为需求变更新增，取代 `FR-85` / `FR-86` / `DN-06` / `DN-32` 中关于"原创 3D 资产、商用授权字体"的表述。
-> **v1.3 修订**：按 `README.md` §6 的代码实际状态回写 PRES-3 / 4 / 5 / 6 / 7 / 9 与 §16.2 / §16.3，
+> **v1.3 修订**：按 `docs/07_PROGRESS.md` §2 的代码实际状态回写 PRES-3 / 4 / 5 / 6 / 7 / 9 与 §16.2 / §16.3，
 > 消除「6 个 `Cuboid`」「2×2 网格 / 水块」「禁 OS 字体」「不存在的生成函数」等占位表述；新增 §16.4 记录细化路线。
 
 ### 16.1 硬约束
@@ -760,12 +761,12 @@ respawn_ticks = (8 + 2 * (level - 1)) * 60, clamp(..., 480, 2400)   // 8~40 s
 
 英雄设计走 `HeroVisual` 数据表 + 6 种剪影原型；技能设计走统一 `AbilityDef` → `AbilityVisual` 与
 `Windup → Release → Travel → Impact → Recover` 五阶段序列。
-完整路线、造型原型矩阵、四技能差异化表、分阶段计划与验收判据见 `README.md` §8。
+完整路线、造型原型矩阵、四技能差异化表、分阶段计划与验收判据见 `docs/07_PROGRESS.md` §4。
 
 > **P-U1 追加（信息层）**：进入即见的三列大厅、6 位英雄档案（定位 / 评分 / 技能 / 出装）、
 > 12 件道具图鉴与真实商店交互、PVE / PVP 模式选择已落地；
 > `ClientMessage::SelectMode` 只在 `MatchPhase::Warmup` 生效，PVP 需 2 名真人才 `Running`。
-> 详见 `docs/06_VISUAL_SPEC.md` §13 与 `README.md` §6.4。
+> 详见 `docs/06_VISUAL_SPEC.md` §13 与 `docs/07_PROGRESS.md` §2.4。
 
 ---
 
