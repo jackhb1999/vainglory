@@ -5,6 +5,7 @@
 use crate::AppState;
 use crate::rendering::{CastEffect, DamageFlash, HitFlash};
 use crate::voxel;
+use bevy::ecs::system::SystemParam;
 use bevy::image::Image;
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
@@ -382,6 +383,22 @@ fn poll_connection(
     }
 }
 
+/// 事件特效资源组。打包成单个 `SystemParam`，把 `receive_server_messages` 的函数
+/// 参数压在 Bevy 的 16 参数上限内（接入 `ClientNavObstacles` 后腾出两个位置）。
+#[derive(SystemParam)]
+struct GameEventFx<'w> {
+    combat_fx: Option<ResMut<'w, crate::rendering::CombatFxQueue>>,
+    event_fx: Option<ResMut<'w, crate::rendering::EventFxQueue>>,
+    pool: Option<ResMut<'w, crate::visual::VoxelMaterialPool>>,
+}
+
+/// 服务端下发的全局 / 逐玩家世界视图，打包释放 `receive_server_messages` 的参数位。
+#[derive(SystemParam)]
+struct ClientWorldView<'w> {
+    nav: Option<ResMut<'w, crate::input::ClientNavObstacles>>,
+    vision: Option<ResMut<'w, crate::fog::ClientVisionSources>>,
+}
+
 /// 接收服务端消息（可靠通道 + 不可靠通道的增量快照）
 #[allow(clippy::too_many_arguments)]
 fn receive_server_messages(
@@ -398,17 +415,38 @@ fn receive_server_messages(
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut combat_fx: Option<ResMut<crate::rendering::CombatFxQueue>>,
-    mut event_fx: Option<ResMut<crate::rendering::EventFxQueue>>,
-    mut pool: Option<ResMut<crate::visual::VoxelMaterialPool>>,
+    mut fx: GameEventFx,
+    mut view: ClientWorldView,
 ) {
     let Some(mut client) = client_res else { return };
 
-    // 增量状态快照走 Unreliable 通道
+    // 增量状态快照与战争迷雾视野源走 Unreliable 通道
     while let Some(bytes) = client.0.receive_message(DefaultChannel::Unreliable) {
-        let Ok(ServerMessage::Snapshot(snap)) = bitcode::decode::<ServerMessage>(bytes.as_ref())
-        else {
+        let Ok(msg) = bitcode::decode::<ServerMessage>(bytes.as_ref()) else {
             continue;
+        };
+        let snap = match msg {
+            ServerMessage::Snapshot(snap) => snap,
+            ServerMessage::VisionUpdate {
+                sources,
+                vision_radius,
+                brush_reveal_radius,
+                server_tick,
+            } => {
+                if let Some(v) = view.vision.as_deref_mut() {
+                    v.0 = Some(crate::fog::VisionSnapshot {
+                        sources: sources
+                            .into_iter()
+                            .map(|p| bevy::math::Vec2::new(p[0], p[1]))
+                            .collect(),
+                        vision_radius,
+                        brush_reveal_radius,
+                        server_tick,
+                    });
+                }
+                continue;
+            }
+            _ => continue,
         };
         if let Some(baseline) = snap.baseline {
             cache.0.clear();
@@ -507,9 +545,9 @@ fn receive_server_messages(
                         &mut materials,
                         &mut hero_registry,
                         &mut local_hero,
-                        combat_fx.as_deref_mut(),
-                        event_fx.as_deref_mut(),
-                        pool.as_deref_mut(),
+                        fx.combat_fx.as_deref_mut(),
+                        fx.event_fx.as_deref_mut(),
+                        fx.pool.as_deref_mut(),
                     );
                 }
             }
@@ -525,9 +563,9 @@ fn receive_server_messages(
                         &mut materials,
                         &mut hero_registry,
                         &mut local_hero,
-                        combat_fx.as_deref_mut(),
-                        event_fx.as_deref_mut(),
-                        pool.as_deref_mut(),
+                        fx.combat_fx.as_deref_mut(),
+                        fx.event_fx.as_deref_mut(),
+                        fx.pool.as_deref_mut(),
                     );
                 }
                 if lobby_info.my_net_id.is_some() && *net_state != NetworkState::InGame {
@@ -544,9 +582,9 @@ fn receive_server_messages(
                     &mut materials,
                     &mut hero_registry,
                     &mut local_hero,
-                    combat_fx.as_deref_mut(),
-                    event_fx.as_deref_mut(),
-                    pool.as_deref_mut(),
+                    fx.combat_fx.as_deref_mut(),
+                    fx.event_fx.as_deref_mut(),
+                    fx.pool.as_deref_mut(),
                 );
             }
             ServerMessage::MatchStateChange { state } => {
@@ -557,6 +595,33 @@ fn receive_server_messages(
                 };
             }
             ServerMessage::Error { message, .. } => warn!("Server error: {}", message),
+            // `NAV-M2-01`：全局动态障碍视图（不经视野裁剪）。
+            // `version` 只做诊断，权威版本由 `NavGrid::rebuild` 依据障碍集合裁决，
+            // 客户端不得上报或自行推断网格（C8）。
+            ServerMessage::NavGridUpdate { snapshot, .. } => {
+                if let Some(nav) = view.nav.as_deref_mut() {
+                    nav.0 = Some(snapshot);
+                }
+            }
+            // 视野源只在 Unreliable 通道发送；这里保留兜底以兼容服务端改通道。
+            ServerMessage::VisionUpdate {
+                sources,
+                vision_radius,
+                brush_reveal_radius,
+                server_tick,
+            } => {
+                if let Some(v) = view.vision.as_deref_mut() {
+                    v.0 = Some(crate::fog::VisionSnapshot {
+                        sources: sources
+                            .into_iter()
+                            .map(|p| bevy::math::Vec2::new(p[0], p[1]))
+                            .collect(),
+                        vision_radius,
+                        brush_reveal_radius,
+                        server_tick,
+                    });
+                }
+            }
             // 增量快照已在 Unreliable 通道处理
             ServerMessage::Snapshot(_) => {}
         }
@@ -730,7 +795,7 @@ fn handle_game_event(
             // 攻击表现：交由渲染层按 attacker / target 位置播放“挥击 → 刀光/弹道 → 命中”序列
             if let Some(fx) = combat_fx {
                 fx.0.push(crate::rendering::CombatFxRequest {
-                    attacker,
+                    attacker: Some(attacker),
                     target,
                     damage,
                     crit: is_critical,
@@ -750,6 +815,23 @@ fn handle_game_event(
                 ));
             }
         }
+        GameEvent::EnvironmentDamage { target, damage, .. } => {
+            // 环境伤害（河水灼烧）**没有攻击者**：`attacker: None` 让渲染层
+            // 只播目标端命中火花 + 冷蓝色伤害数字，不触发挥击 / 刀光 / 弹道。
+            if let Some(fx) = combat_fx {
+                fx.0.push(crate::rendering::CombatFxRequest {
+                    attacker: None,
+                    target,
+                    damage,
+                    crit: false,
+                });
+            }
+            if let Some(&e) = hero_registry.0.get(&target) {
+                commands
+                    .entity(e)
+                    .insert((HitFlash { t: 0.25 }, crate::hero_anim::HitAnim { t: 0.28 }));
+            }
+        }
         GameEvent::MatchStart {
             blue_heroes,
             red_heroes,
@@ -764,9 +846,13 @@ fn handle_game_event(
         }
         GameEvent::HeroDeath { victim, .. } => {
             if let Some(&e) = hero_registry.0.get(&victim) {
-                commands
-                    .entity(e)
-                    .insert(crate::hero_anim::DeathAnim { t: 1.2 });
+                // 关键事件比下一帧快照更早到达：立即整株隐藏，杜绝「血空人还在」。
+                // 重生由 `sync_hero_death_visuals` 依据权威血量恢复。
+                commands.entity(e).insert((
+                    crate::rendering::DeadHero,
+                    Visibility::Hidden,
+                    crate::hero_anim::DeathAnim { t: 1.2 },
+                ));
             }
             push_fx(voxel::PixelKind::Gold, FxShape::Orb, Vec3::ZERO, 10, 82);
         }
@@ -781,8 +867,21 @@ fn handle_game_event(
         GameEvent::JungleMonsterDeath { .. } => {
             push_fx(voxel::PixelKind::Brush, FxShape::Orb, Vec3::ZERO, 6, 84);
         }
-        GameEvent::AbyssWardenDeath { .. } => {
-            push_fx(voxel::PixelKind::Brush, FxShape::Orb, Vec3::ZERO, 6, 84);
+        // §13.4 渊卫（中央矿坑全局首领）与 §13.2 兵矿收益的表现。
+        GameEvent::AbyssWardenSpawn { position } => {
+            push_fx(
+                voxel::PixelKind::Gold,
+                FxShape::Ring,
+                Vec3::new(position.x, 0.0, position.z),
+                14,
+                97,
+            );
+        }
+        GameEvent::AbyssWardenDeath { killer_team } => {
+            push_fx(team_kind(killer_team), FxShape::Ring, Vec3::ZERO, 12, 98);
+        }
+        GameEvent::ObjectiveIncome { owner, .. } => {
+            push_fx(team_kind(owner), FxShape::Pulse, Vec3::ZERO, 3, 99);
         }
         GameEvent::LodeShrineCapture { team }
         | GameEvent::ObjectiveCaptured { owner: team, .. } => {
@@ -823,6 +922,21 @@ fn handle_game_event(
     }
 }
 
+/// 组包输入位：bit0 = 普攻（右键锁定目标），bit1..4 = 技能槽，阵亡时一律清零。
+///
+/// 旧实现 `let mut mask = 0u8` 丢掉了 bit0，服务端 `attack_system` 因此永远收不到
+/// 普攻指令 —— 野怪、英雄、哨塔都打不了。此纯函数把「普攻位必须透传」固化为回归护栏。
+fn encode_ability_mask(dead: bool, input_mask: u8, pending_slot: Option<u8>) -> u8 {
+    if dead {
+        return 0;
+    }
+    let mut mask = input_mask & 0b0001;
+    if let Some(slot) = pending_slot {
+        mask |= 1u8 << (slot + 1);
+    }
+    mask
+}
+
 /// 发送本地输入：带序号、时间戳、内容 hash、校验和与真实 RTT（`DN-13` / `FR-56`）
 fn send_input(
     client_res: Option<ResMut<RenetClientResource>>,
@@ -838,16 +952,19 @@ fn send_input(
         return;
     }
 
-    let mut mask = 0u8;
+    // 普攻位（bit0）+ 待发技能位，全部经纯函数编码，阵亡时归零。
     let mut aim = input.aim_dir;
-    if let Some(mut pending) = pending
-        && let Some(slot) = pending.slot
+    let pending_slot = pending
+        .as_deref()
+        .and_then(|p| if input.dead { None } else { p.slot });
+    let mask = encode_ability_mask(input.dead, input.ability_mask, pending_slot);
+    if let Some(mut p) = pending
+        && pending_slot.is_some()
     {
-        mask |= 1u8 << (slot + 1);
-        aim = pending.aim;
-        pending.frames = pending.frames.saturating_sub(1);
-        if pending.frames == 0 {
-            pending.slot = None;
+        aim = p.aim;
+        p.frames = p.frames.saturating_sub(1);
+        if p.frames == 0 {
+            p.slot = None;
         }
     }
 
@@ -856,10 +973,18 @@ fn send_input(
         tick: 0,
         seq: session.seq,
         client_time_us: now_micros(),
-        move_dir: input.move_dir.into(),
+        move_dir: if input.dead {
+            Vec2::ZERO.into()
+        } else {
+            input.move_dir.into()
+        },
         aim_dir: aim.into(),
         ability_mask: mask,
-        target_net_id: input.target_net_id.map(|n| n.0),
+        target_net_id: if input.dead {
+            None
+        } else {
+            input.target_net_id.map(|n| n.0)
+        },
         ping: session.rtt_ms,
         config_hash: session.config_hash,
         checksum: 0,
@@ -880,5 +1005,29 @@ pub fn handle_state_transitions(
 ) {
     if *net_state == NetworkState::Connecting && lobby_info.my_net_id.is_some() {
         *net_state = NetworkState::Connected;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic_attack_bit_is_always_forwarded() {
+        assert_eq!(encode_ability_mask(false, 0b0001, None), 0b0001);
+        assert_eq!(encode_ability_mask(false, 0b1111_1111, None), 0b0001);
+        assert_eq!(encode_ability_mask(false, 0b0000, None), 0);
+    }
+
+    #[test]
+    fn ability_slots_occupy_bits_1_to_4() {
+        assert_eq!(encode_ability_mask(false, 0, Some(0)), 0b0010);
+        assert_eq!(encode_ability_mask(false, 0, Some(2)), 0b1000);
+        assert_eq!(encode_ability_mask(false, 1, Some(0)), 0b0011);
+    }
+
+    #[test]
+    fn dead_hero_sends_no_actions() {
+        assert_eq!(encode_ability_mask(true, 0b0001, Some(0)), 0);
     }
 }

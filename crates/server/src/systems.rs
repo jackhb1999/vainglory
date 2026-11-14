@@ -3,7 +3,7 @@
 use bevy::prelude::*;
 use game_core::abilities::*;
 use game_core::components::*;
-use game_core::map::MAP_HALF;
+use game_core::map::{MAP_H_HALF, MAP_W_HALF};
 use game_core::net::{GameEvent, Vec3f};
 use game_core::systems::*;
 
@@ -63,8 +63,8 @@ pub fn ability_cast_system(
             let aim_xz = Vec2::new(input.aim_dir.x, input.aim_dir.y);
             let valid = aim_xz.is_finite()
                 && aim_xz.length_squared() > 1e-4
-                && aim_xz.x.abs() <= MAP_HALF
-                && aim_xz.y.abs() <= MAP_HALF;
+                && aim_xz.x.abs() <= MAP_W_HALF
+                && aim_xz.y.abs() <= MAP_H_HALF;
             // 距离取水平距离：旧版用 3D `length()` 会被施法者的 y 分量污染。
             let flat = Vec2::new(aim_xz.x - caster_pos.x, aim_xz.y - caster_pos.z);
             let dist = if valid { flat.length() } else { 0.0 };
@@ -204,21 +204,75 @@ pub fn projectile_system(
     }
 }
 
-/// 结算指向/瞬发 AoE 的待结算伤害（PendingHit）。死亡则销毁实体（训练假人除外）。
+/// 结算指向/瞬发 AoE 的待结算伤害（PendingHit）。
+///
+/// 具备 `RespawnState` 的英雄绝不在此 despawn：技能致死也必须走 `death_respawn_system`
+/// 的统一死亡/重生流程，否则「被技能打死」的英雄会永久消失、永不复活。
 pub fn resolve_pending_hits(
     mut commands: Commands,
-    mut hits: Query<(Entity, &mut Hero, &PendingHit, Option<&TrainingDummy>)>,
+    mut hits: Query<(
+        Entity,
+        &mut Hero,
+        &PendingHit,
+        Option<&TrainingDummy>,
+        Option<&game_core::gameplay::respawn::RespawnState>,
+    )>,
     mut damage_sink: Option<ResMut<game_core::components::DamageSink>>,
 ) {
-    for (entity, mut hero, hit, dummy) in hits.iter_mut() {
+    for (entity, mut hero, hit, dummy, respawn_state) in hits.iter_mut() {
         let dealt = apply_mitigated_damage(&mut hero, hit.damage, hit.damage_type);
         if let Some(sink) = damage_sink.as_deref_mut() {
             sink.0.push((hit.attacker, entity, dealt, hit.damage_type));
         }
-        if hero.health <= 0.0 && dummy.is_none() {
+        if hero.health <= 0.0 && dummy.is_none() && respawn_state.is_none() {
             commands.entity(entity).despawn();
         }
         commands.entity(entity).remove::<PendingHit>();
+    }
+}
+
+/// 河道浅滩的**权威持续伤害**（每 0.5 s 结算一次）。
+///
+/// - 只有 `is_hazardous_river` 为真（在河里且不在桥面）的**英雄**受伤：
+///   小兵沿兵线走桥、野怪是固定设施，都不该被环境伤害磨死。
+/// - 阵亡 / 复活无敌期的英雄免伤；真实伤害不吃护甲减免。
+/// - 扣血只写 `Hero.health`，死亡判定统一交给 `death_respawn_system`
+///   （它以权威血量登记死亡，所以淹死也能正常进复活流程、广播 HeroDeath）。
+/// - 广播 `EnvironmentDamage` 而不是 `DamageDealt`：环境伤害没有攻击者，
+///   走 DamageDealt 会让客户端误播一次攻击者的挥击动画。
+pub fn river_hazard_system(
+    tick: Res<crate::simulation::ServerTick>,
+    mut query: Query<(
+        &NetId,
+        &mut Hero,
+        &Transform,
+        Option<&game_core::gameplay::respawn::RespawnState>,
+    )>,
+    mut server_events: ResMut<ServerEvents>,
+) {
+    if !tick
+        .0
+        .is_multiple_of(game_core::map::RIVER_HAZARD_PERIOD_TICKS)
+    {
+        return;
+    }
+    for (net_id, mut hero, transform, respawn) in query.iter_mut() {
+        if hero.health <= 0.0 {
+            continue;
+        }
+        if respawn.is_some_and(|s| s.dead || tick.0 < s.invulnerable_until_tick) {
+            continue;
+        }
+        if !game_core::map::is_hazardous_river(transform.translation) {
+            continue;
+        }
+        let damage = game_core::map::RIVER_HAZARD_DAMAGE.min(hero.health);
+        hero.health = (hero.health - damage).max(0.0);
+        server_events.0.push(GameEvent::EnvironmentDamage {
+            target: *net_id,
+            damage,
+            kind: 0,
+        });
     }
 }
 
@@ -246,5 +300,107 @@ pub fn flush_damage_events(
                 is_critical: false,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod river_hazard_tests {
+    use super::*;
+    use game_core::gameplay::respawn::RespawnState;
+    use game_core::map::{LANE_Z, MAP_SCALE, RIVER_HAZARD_DAMAGE, RIVER_HAZARD_PERIOD_TICKS};
+
+    const PERIOD: u64 = RIVER_HAZARD_PERIOD_TICKS;
+
+    struct Fixture {
+        app: App,
+        hero: Entity,
+    }
+
+    fn fixture(tick: u64, pos: Vec3, health: f32, respawn: Option<RespawnState>) -> Fixture {
+        let mut app = App::new();
+        app.insert_resource(crate::simulation::ServerTick(tick))
+            .insert_resource(ServerEvents::default())
+            .add_systems(Update, river_hazard_system);
+        let mut entity = app.world_mut().spawn((
+            NetId(7),
+            Hero {
+                health,
+                ..default()
+            },
+            Transform::from_translation(pos),
+        ));
+        if let Some(state) = respawn {
+            entity.insert(state);
+        }
+        let hero = entity.id();
+        Fixture { app, hero }
+    }
+
+    fn health(f: &mut Fixture) -> f32 {
+        f.app.world().entity(f.hero).get::<Hero>().unwrap().health
+    }
+
+    fn events(f: &mut Fixture) -> usize {
+        f.app.world().resource::<ServerEvents>().0.len()
+    }
+
+    #[test]
+    fn standing_in_river_burns_hero_and_broadcasts_once() {
+        let mut f = fixture(PERIOD, Vec3::new(0.0, 0.0, 40.0 * MAP_SCALE), 1000.0, None);
+        f.app.update();
+        assert_eq!(health(&mut f), 1000.0 - RIVER_HAZARD_DAMAGE);
+        assert_eq!(events(&mut f), 1);
+    }
+
+    #[test]
+    fn bridge_land_and_non_period_ticks_are_safe() {
+        // 桥面（兵线跨河处）安全
+        let mut bridge = fixture(PERIOD, Vec3::new(0.0, 0.0, LANE_Z), 1000.0, None);
+        bridge.app.update();
+        assert_eq!(health(&mut bridge), 1000.0);
+        assert_eq!(events(&mut bridge), 0);
+        // 陆地安全
+        let mut land = fixture(PERIOD, Vec3::new(40.0 * MAP_SCALE, 0.0, 0.0), 1000.0, None);
+        land.app.update();
+        assert_eq!(health(&mut land), 1000.0);
+        // 非结算 tick 不掉血
+        let mut off = fixture(
+            PERIOD + 1,
+            Vec3::new(0.0, 0.0, 40.0 * MAP_SCALE),
+            1000.0,
+            None,
+        );
+        off.app.update();
+        assert_eq!(health(&mut off), 1000.0);
+        assert_eq!(events(&mut off), 0);
+    }
+
+    #[test]
+    fn dead_and_invulnerable_heroes_are_exempt() {
+        let mut dead = fixture(PERIOD, Vec3::new(0.0, 0.0, 40.0 * MAP_SCALE), 0.0, None);
+        dead.app.update();
+        assert_eq!(health(&mut dead), 0.0);
+        assert_eq!(events(&mut dead), 0);
+
+        let invuln = RespawnState {
+            invulnerable_until_tick: PERIOD + 100,
+            ..default()
+        };
+        let mut f = fixture(
+            PERIOD,
+            Vec3::new(0.0, 0.0, 40.0 * MAP_SCALE),
+            1000.0,
+            Some(invuln),
+        );
+        f.app.update();
+        assert_eq!(health(&mut f), 1000.0);
+    }
+
+    #[test]
+    fn damage_never_drives_health_below_zero() {
+        let mut f = fixture(PERIOD, Vec3::new(0.0, 0.0, 40.0 * MAP_SCALE), 10.0, None);
+        f.app.update();
+        assert_eq!(health(&mut f), 0.0);
+        assert_eq!(events(&mut f), 1);
     }
 }

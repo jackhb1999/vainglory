@@ -11,7 +11,7 @@ use crate::networking::ReceivedSnapshot;
 use crate::voxel::{self, PixelKind};
 use bevy::image::Image;
 use bevy::prelude::*;
-use game_core::components::{Interpolated, NetId, TransformSync};
+use game_core::components::{Interpolated, NetId, Selectable, TransformSync};
 use game_core::net::EntityType;
 use std::collections::{HashMap, HashSet};
 
@@ -189,6 +189,16 @@ pub fn sync_monsters(
             TransformSync::default(),
             Interpolated,
             MonsterVisual,
+            // 右键锁定普攻目标：handle_input 的候选查询要求 Selectable。
+            Selectable {
+                radius: 2.2,
+                height: 3.4,
+            },
+            crate::rendering::WorldHealthBar {
+                health: es.health,
+                max_health: es.max_health,
+                y_offset: 4.0,
+            },
         ));
     }
     let dt = time.delta_secs();

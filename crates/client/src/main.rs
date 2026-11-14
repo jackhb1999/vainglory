@@ -7,6 +7,7 @@ use bevy_egui::EguiPlugin;
 use client::{
     AppState,
     audio::{ChipAudioPlugin, ChipSource},
+    fog::FogPlugin,
     input::InputPlugin,
     interpolation::InterpolationPlugin,
     networking::NetworkingPlugin,
@@ -38,6 +39,7 @@ fn main() {
         .add_plugins(InputPlugin)
         .add_plugins(PredictionPlugin)
         .add_plugins(InterpolationPlugin)
+        .add_plugins(FogPlugin)
         .add_plugins(UiPlugin)
         .init_state::<AppState>()
         .insert_resource(ClearColor(Color::srgb(0.1, 0.1, 0.15)))

@@ -64,18 +64,35 @@ pub struct DeathAnim {
     pub t: f32,
 }
 
-/// 触发速度阈值（世界单位/秒），低于此视为待机。
-const MOVE_SPEED_THRESHOLD: f32 = 0.35;
+/// 进入 / 退出移动态的速度阈值（滞回，避免帧间速度噪声导致待机↔走路反复横跳）。
+const MOVE_ENTER_THRESHOLD: f32 = 0.55;
+const MOVE_EXIT_THRESHOLD: f32 = 0.25;
+/// 速度低通滤波时间常数（秒）：预测对账的单帧位移尖峰不应立刻切动画状态。
+const SPEED_SMOOTH_TAU: f32 = 0.09;
 /// 入场 / 重生重组时长。
 const RESPAWN_DURATION: f32 = 0.6;
 
+/// 纯函数：带滞回的「是否在走路」判定，便于单测固化不抖动的行为。
+pub fn is_moving(state: HeroAnimState, speed: f32) -> bool {
+    if state == HeroAnimState::Move {
+        speed > MOVE_EXIT_THRESHOLD
+    } else {
+        speed > MOVE_ENTER_THRESHOLD
+    }
+}
+
 /// 系统 A：从父实体位移推断速度。只读 `Transform`，不写任何子节点。
+///
+/// 位移差直接除以 dt 会被回滚修正的单帧位移放大成速度尖峰，动画随即在
+/// 待机/走路间来回切换（视觉上的「乱晃」）。这里做指数低通平滑。
 pub fn update_hero_motion(time: Res<Time>, mut heroes: Query<(&mut HeroAnim, &Transform)>) {
     let dt = time.delta_secs().max(1e-4);
+    let blend = 1.0 - (-dt / SPEED_SMOOTH_TAU).exp();
     for (mut anim, tr) in heroes.iter_mut() {
         let p = tr.translation;
         // 只取水平位移，避免重生下沉/跳跃被误判为移动。
-        anim.speed = Vec2::new(p.x - anim.last_pos.x, p.z - anim.last_pos.z).length() / dt;
+        let raw = Vec2::new(p.x - anim.last_pos.x, p.z - anim.last_pos.z).length() / dt;
+        anim.speed += (raw.min(40.0) - anim.speed) * blend;
         anim.last_pos = p;
     }
 }
@@ -111,7 +128,7 @@ pub fn tick_hero_anim(
             HeroAnimState::Cast
         } else if attack.is_some() {
             HeroAnimState::Attack
-        } else if anim.speed > MOVE_SPEED_THRESHOLD {
+        } else if is_moving(anim.state, anim.speed) {
             HeroAnimState::Move
         } else {
             HeroAnimState::Idle
@@ -243,7 +260,7 @@ mod tests {
             HeroAnimState::Cast
         } else if attack {
             HeroAnimState::Attack
-        } else if speed > MOVE_SPEED_THRESHOLD {
+        } else if is_moving(HeroAnimState::Idle, speed) {
             HeroAnimState::Move
         } else {
             HeroAnimState::Idle
@@ -258,6 +275,19 @@ mod tests {
         assert_eq!(pick(true, true, false, false, 1.0), HeroAnimState::Cast);
         assert_eq!(pick(true, true, true, false, 1.0), HeroAnimState::Hit);
         assert_eq!(pick(true, true, true, true, 1.0), HeroAnimState::Death);
+    }
+
+    /// 回归护栏：速度在阈值附近抖动时不得来回切换移动/待机。
+    #[test]
+    fn move_state_has_hysteresis() {
+        assert!(!is_moving(HeroAnimState::Idle, 0.0));
+        assert!(!is_moving(HeroAnimState::Idle, 0.4), "低于进入阈值不应起步");
+        assert!(is_moving(HeroAnimState::Idle, 1.0));
+        assert!(
+            is_moving(HeroAnimState::Move, 0.3),
+            "已进入移动态后，低于退出阈值才停"
+        );
+        assert!(!is_moving(HeroAnimState::Move, 0.1));
     }
 
     #[test]

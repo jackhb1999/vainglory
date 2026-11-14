@@ -14,10 +14,18 @@ use game_core::components::*;
 use game_core::gameplay::{
     GameplayEvents, NetEvent, attributes,
     clock::{MatchClock, MatchMode, MatchPhase},
-    combat, jungle, registry, structures,
+    combat, jungle,
+    objectives::ObjectiveCapturedEvent,
+    objectives_economy::{
+        ABYSS_WARDEN_CAPTURE_PER_PLAYER_GOLD, ABYSS_WARDEN_CAPTURE_TEAM_GOLD, AbyssWardenState,
+        LODE_SHRINE_CAPTURE_PER_PLAYER_GOLD, OBJECTIVE_ABYSS_WARDEN, OBJECTIVE_LODE_SHRINE,
+        ObjectiveIncomeState, WARDEN_MINION_AD_MULT, WARDEN_MINION_HP_MULT,
+        WARDEN_MINION_SPEED_BONUS, WardenBuff,
+    },
+    registry, structures,
     waves::{self, MinionAi, WaveDef},
 };
-use game_core::net::{GameEvent, ServerMessage, Vec3f};
+use game_core::net::{GameEvent, JungleMonsterType, ServerMessage, Vec3f};
 use game_core::systems::{AttackCommand, SimTime};
 use renet2::DefaultChannel;
 
@@ -143,6 +151,7 @@ pub fn wave_spawn_system(
     mut commands: Commands,
     mut next_net_id: ResMut<NextNetId>,
     mut events: ResMut<GameplayEvents>,
+    warden_buff: Option<Res<WardenBuff>>,
 ) {
     if clock.is_over() {
         return;
@@ -163,6 +172,20 @@ pub fn wave_spawn_system(
                     MinionType::Ranged => (320.0, 30.0, 3.0, 5.5, 22),
                     MinionType::Siege => (900.0, 48.0, 2.6, 7.0, 40),
                     MinionType::Super => (1400.0, 70.0, 3.4, 2.0, 60),
+                };
+                // §13.4：渊卫归属期间，归属方**新生成**的战偶获得推进强化。
+                // 已存在的战偶不回溯增强；半径 20 的光环简化为整条兵线（见文档偏差登记）。
+                let warden = warden_buff
+                    .as_deref()
+                    .is_some_and(|b| b.active(team, clock.tick));
+                let (hp, ad, ms) = if warden {
+                    (
+                        hp * WARDEN_MINION_HP_MULT,
+                        ad * WARDEN_MINION_AD_MULT,
+                        ms + WARDEN_MINION_SPEED_BONUS,
+                    )
+                } else {
+                    (hp, ad, ms)
                 };
                 commands.spawn((
                     net_id,
@@ -281,7 +304,8 @@ pub fn world_damage_system(
     )>,
     mut minions: Query<(&mut Minion, &NetId)>,
     mut monsters: Query<(&mut JungleMonster, &NetId)>,
-    mut heroes: Query<&mut Hero>,
+    mut heroes: Query<(&mut Hero, Option<&Team>)>,
+    mut warden: Option<ResMut<AbyssWardenState>>,
 ) {
     for (_attacker_entity, cmd) in attackers.iter() {
         let raw = cmd.damage;
@@ -329,7 +353,7 @@ pub fn world_damage_system(
             let dealt = raw * 100.0 / (100.0 + minion.armor.max(0.0));
             minion.health = (minion.health - dealt).max(0.0);
             if minion.health <= combat::EPS {
-                if let Ok(mut attacker_hero) = heroes.get_mut(cmd.attacker) {
+                if let Ok((mut attacker_hero, _)) = heroes.get_mut(cmd.attacker) {
                     attacker_hero.gold = attacker_hero.gold.saturating_add(minion.gold_reward);
                     attacker_hero.experience =
                         attacker_hero.experience.saturating_add(minion.exp_reward);
@@ -344,28 +368,65 @@ pub fn world_damage_system(
         if let Ok((mut monster, nid)) = monsters.get_mut(cmd.target) {
             let dealt = raw * 100.0 / (100.0 + monster.armor.max(0.0));
             monster.health = (monster.health - dealt).max(0.0);
+            let is_warden = monster.monster_type == JungleMonsterType::AbyssWarden;
+            if is_warden {
+                // §13.4：按队伍累计**英雄**造成的伤害判定归属，不用最后一击。
+                // 只读查询拿队伍，避免与下面的可写借用同时存活。
+                let team = heroes.get(cmd.attacker).ok().and_then(|(_, t)| t.copied());
+                if let Some(state) = warden.as_deref_mut() {
+                    state.record_damage(team, dealt);
+                }
+            }
             if monster.health <= combat::EPS {
-                if let Ok(mut attacker_hero) = heroes.get_mut(cmd.attacker) {
+                if let Ok((mut attacker_hero, _)) = heroes.get_mut(cmd.attacker) {
                     attacker_hero.gold = attacker_hero.gold.saturating_add(monster.gold_reward);
                     attacker_hero.experience =
                         attacker_hero.experience.saturating_add(monster.exp_reward);
                 }
                 events.emit(NetEvent::JungleMonsterDeath { net_id: nid.0 });
+                if is_warden {
+                    let owner = warden
+                        .as_deref_mut()
+                        .and_then(|state| state.on_defeated(clock.tick));
+                    let killer_team = owner.unwrap_or(Team::Neutral);
+                    events.emit(NetEvent::AbyssWardenDeath { killer_team });
+                    if let Some(owner) = owner {
+                        // 复用既有占领流水：objective_buff_system 会发放 120s 全队增益
+                        // 并广播 ObjectiveCaptured / ObjectiveBuffGranted，无需第二套 buff 代码。
+                        events.captured.push(ObjectiveCapturedEvent {
+                            objective_id: OBJECTIVE_ABYSS_WARDEN,
+                            owner,
+                            event_id: (clock.tick << 8) | u64::from(OBJECTIVE_ABYSS_WARDEN),
+                        });
+                    }
+                }
                 commands.entity(cmd.target).despawn();
             }
         }
     }
 }
 
-/// 野怪在 Aggro 状态下对射程内英雄发起攻击（旧 `jungle_ai_system` 是死代码）。
+/// 野怪对射程内英雄发起攻击（旧 `jungle_ai_system` 是死代码）。
+///
+/// P-U8 修两处旧缺口：
+/// - **静止型营地不反击**：`step_monster` 让 `move_speed = 0` 的征募井 / 辉矿恒为
+///   `Idle`，而旧版要求 `state == Aggro`，这 3 个营地因此永远打不到人。现在静止型
+///   只要射程内有存活英雄就反击（与 `MonsterOutput.should_attack` 语义对齐）。
+/// - **无攻击冷却**：旧版每 tick 插入一次 `AttackCommand`，被 `damage_system` 当 tick
+///   消费，等于 60 次/秒。现在按 `attack_interval_ticks` 节流，时间点一律取权威
+///   `SimTime::tick()`，0 值兜底为 60 tick（1 秒）。
 pub fn monster_attack_system(
     time: Res<SimTime>,
     mut commands: Commands,
-    mut monsters: Query<(Entity, &Transform, &JungleMonster, &jungle::MonsterAi)>,
+    mut monsters: Query<(Entity, &Transform, &mut JungleMonster, &jungle::MonsterAi)>,
     heroes: Query<(Entity, &Transform, &Hero, Option<&Team>)>,
 ) {
-    for (entity, transform, monster, ai) in monsters.iter_mut() {
-        if ai.state != jungle::MonsterState::Aggro {
+    let tick = time.tick();
+    for (entity, transform, mut monster, ai) in monsters.iter_mut() {
+        if tick < monster.next_attack_tick {
+            continue;
+        }
+        if ai.state != jungle::MonsterState::Aggro && !ai.is_static() {
             continue;
         }
         let pos = transform.translation;
@@ -384,8 +445,14 @@ pub fn monster_attack_system(
                 attacker: entity,
                 damage: monster.attack_damage,
                 damage_type: DamageType::Physical,
-                tick: time.tick(),
+                tick,
             });
+            let interval = if monster.attack_interval_ticks == 0 {
+                60
+            } else {
+                monster.attack_interval_ticks
+            };
+            monster.next_attack_tick = tick + interval;
         }
     }
 }
@@ -397,6 +464,9 @@ pub fn monster_attack_system(
 /// 占领成功 → 给归属方全队发放可过期的 buff，并广播全局事件。
 #[allow(clippy::type_complexity)]
 pub fn objective_buff_system(
+    clock: Res<MatchClock>,
+    mut income: ResMut<ObjectiveIncomeState>,
+    mut warden_buff: ResMut<WardenBuff>,
     mut events: ResMut<GameplayEvents>,
     mut heroes: Query<(
         &Team,
@@ -407,6 +477,33 @@ pub fn objective_buff_system(
 ) {
     let captured_all = std::mem::take(&mut events.captured);
     for captured in captured_all {
+        if captured.objective_id == OBJECTIVE_ABYSS_WARDEN {
+            // §14.4 渊卫归属赏金 + §13.4 推进增益 120 s
+            for (team, _, mut hero, _) in heroes.iter_mut() {
+                if *team == captured.owner {
+                    hero.gold = hero
+                        .gold
+                        .saturating_add(ABYSS_WARDEN_CAPTURE_PER_PLAYER_GOLD);
+                }
+            }
+            income.credit_team(captured.owner, ABYSS_WARDEN_CAPTURE_TEAM_GOLD);
+            warden_buff.grant(captured.owner, clock.tick);
+        }
+        // §13.2：兵矿占领瞬间全队每人 +40、团队池 +120，并重置该队的收益计时，
+        // 避免「刚占领立刻又发一次 30 金」。渊卫（id 3）不享受这笔钱。
+        if captured.objective_id == OBJECTIVE_LODE_SHRINE {
+            for (team, _, mut hero, _) in heroes.iter_mut() {
+                if *team == captured.owner {
+                    hero.gold = hero
+                        .gold
+                        .saturating_add(LODE_SHRINE_CAPTURE_PER_PLAYER_GOLD);
+                }
+            }
+            income.on_captured(captured.objective_id, captured.owner, clock.tick);
+            events.emit(NetEvent::LodeShrineCapture {
+                team: captured.owner,
+            });
+        }
         let Some(buff) = attributes::objective_buff(captured.objective_id, captured.owner) else {
             continue;
         };
@@ -510,5 +607,125 @@ mod tests {
         assert!(app.world().resource::<PveBotReady>().0);
         assert_eq!(app.world().resource::<NextNetId>().0, 1);
         assert_eq!(app.world().resource::<DummyRegistry>().0.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod monster_attack_tests {
+    use super::*;
+    use game_core::net::JungleMonsterType;
+
+    fn monster(move_speed: f32, attack_range: f32, interval: u64) -> JungleMonster {
+        JungleMonster {
+            monster_type: JungleMonsterType::MusterWell,
+            max_health: 1000.0,
+            health: 1000.0,
+            attack_damage: 25.0,
+            armor: 0.0,
+            magic_resist: 0.0,
+            move_speed,
+            attack_range,
+            gold_reward: 0,
+            exp_reward: 0,
+            aggro_range: 10.0,
+            leash_range: 15.0,
+            spawn_tick: 0,
+            last_attacker: None,
+            attack_interval_ticks: interval,
+            next_attack_tick: 0,
+        }
+    }
+
+    /// tick 0 且英雄在射程内，构造一只静止型 + 一只追击型（可选）。
+    fn fixture(move_speed: f32, attack_range: f32, interval: u64, hero_x: f32) -> (App, Entity) {
+        let mut app = App::new();
+        app.insert_resource(SimTime(0))
+            .add_systems(Update, monster_attack_system);
+        let ai = jungle::MonsterAi::new(Vec2::ZERO, 1000.0, 10.0, 15.0, move_speed);
+        let e = app
+            .world_mut()
+            .spawn((
+                Transform::from_translation(Vec3::ZERO),
+                monster(move_speed, attack_range, interval),
+                ai,
+                Team::Neutral,
+            ))
+            .id();
+        app.world_mut().spawn((
+            Transform::from_translation(Vec3::new(hero_x, 0.0, 0.0)),
+            Hero::default(),
+            Team::Blue,
+        ));
+        (app, e)
+    }
+
+    fn attack_count(app: &mut App) -> usize {
+        let mut q = app.world_mut().query::<&AttackCommand>();
+        q.iter(app.world()).count()
+    }
+
+    fn clear_attack(app: &mut App, e: Entity) {
+        app.world_mut().entity_mut(e).remove::<AttackCommand>();
+    }
+
+    /// 静止型（征募井 / 辉矿）状态机恒为 Idle，旧版要求 Aggro 导致永不反击。
+    #[test]
+    fn static_camps_retaliate_while_idle() {
+        let (mut app, e) = fixture(0.0, 6.0, 60, 3.0);
+        app.update();
+        assert_eq!(attack_count(&mut app), 1, "静止型射程内必须反击");
+        assert_eq!(
+            app.world()
+                .entity(e)
+                .get::<JungleMonster>()
+                .unwrap()
+                .next_attack_tick,
+            60
+        );
+    }
+
+    /// 冷却按权威 tick 裁决：间隔内不重复插入，到期后再攻击。
+    #[test]
+    fn attack_is_rate_limited_by_authoritative_tick() {
+        let (mut app, e) = fixture(0.0, 6.0, 60, 3.0);
+        app.update();
+        assert_eq!(attack_count(&mut app), 1);
+        clear_attack(&mut app, e);
+
+        for tick in [1, 30, 59] {
+            app.insert_resource(SimTime(tick));
+            app.update();
+            assert_eq!(attack_count(&mut app), 0, "tick {tick} 仍在冷却中");
+        }
+        app.insert_resource(SimTime(60));
+        app.update();
+        assert_eq!(attack_count(&mut app), 1, "冷却到期应再次攻击");
+    }
+
+    /// 射程外不攻击；非静止型保持「必须进入 Aggro 才攻击」的原语义。
+    #[test]
+    fn out_of_range_and_idle_roamers_do_not_attack() {
+        let (mut far, _) = fixture(0.0, 6.0, 60, 20.0);
+        far.update();
+        assert_eq!(attack_count(&mut far), 0);
+
+        let (mut roamer, _) = fixture(3.5, 6.0, 60, 3.0);
+        roamer.update();
+        assert_eq!(attack_count(&mut roamer), 0, "Idle 追击型不应攻击");
+    }
+
+    /// 0 间隔兜底为 60 tick，避免配置遗漏导致 60 次/秒。
+    #[test]
+    fn zero_interval_falls_back_to_one_second() {
+        let (mut app, e) = fixture(0.0, 6.0, 0, 3.0);
+        app.update();
+        assert_eq!(
+            app.world()
+                .entity(e)
+                .get::<JungleMonster>()
+                .unwrap()
+                .next_attack_tick,
+            60
+        );
     }
 }

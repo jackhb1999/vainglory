@@ -106,6 +106,8 @@ fn gameplay_systems_drive_a_full_ecs_match_slice() {
             leash_range: 15.0,
             spawn_tick: 900,
             last_attacker: None,
+            attack_interval_ticks: 60,
+            next_attack_tick: 0,
         },
     ));
     app.world_mut().spawn((

@@ -15,6 +15,7 @@ use game_core::gameplay::registry;
 use game_core::gameplay::shop::{INVENTORY_SLOTS, ItemDef, ShopCatalog};
 
 use crate::AppState;
+use crate::input::ShopOpen;
 use crate::lobby::{
     ABILITY_NOTES_EN, ABILITY_NOTES_ZH, ClientCommand, ClientCommandQueue, CodexOpen,
     HERO_PROFILES, ITEM_CATEGORIES, LobbySelection, MatchModeExt, RATING_LABELS_EN,
@@ -157,8 +158,8 @@ fn draw_mode_column(
         ui,
         t(
             lang,
-            "左键点击地面 移动（自动寻路）· WASD/方向键 直接移动",
-            "LMB click ground to move · WASD/Arrows also move",
+            "左键点击地面 移动（自动寻路）· 右键 立即移动 / 锁定攻击",
+            "LMB click ground to move · RMB force move / lock target",
         ),
     );
     muted(ui, t(lang, "右键  锁定普攻", "RMB  attack"));
@@ -441,26 +442,26 @@ pub fn draw_item_codex(
 pub fn draw_shop(
     mut contexts: EguiContexts,
     lang: Res<UiLanguage>,
-    mut open: Local<bool>,
+    // 商店开关由 `input::update_input_gate`（Update 调度）统一切换：按下 P 的当帧就冻结
+    // 世界输入，避免旧版「UI pass 各自 toggle 一个 `Local<bool>`」与输入系统不同步、
+    // 点击穿透到地面移动英雄。这里只读同一份 `ShopOpen` 资源，不再自己管开关。
+    mut open: ResMut<ShopOpen>,
     mut filter: Local<u8>,
     mut queue: ResMut<ClientCommandQueue>,
     toast: Res<ShopToast>,
     heroes: Query<&Hero, With<LocalPlayer>>,
 ) {
+    if !open.0 {
+        return;
+    }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    if ctx.input(|i| i.key_pressed(egui::Key::P)) {
-        *open = !*open;
-    }
-    if !*open {
-        return;
-    }
     let cjk = lang.cjk;
     let gold = heroes.iter().next().map(|h| h.gold).unwrap_or(0);
     let catalog = ShopCatalog::placeholder();
     egui::Window::new(t(&lang, "商店 / SHOP (P)", "SHOP (P)"))
-        .open(&mut open)
+        .open(&mut open.0)
         .default_width(520.0)
         .default_height(560.0)
         .show(ctx, |ui| {

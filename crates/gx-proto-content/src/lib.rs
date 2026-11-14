@@ -306,17 +306,20 @@ impl ContentTables {
                     per_player_reward: 100,
                 },
             ],
+            // 与 `game_core::map` 同源的 2:1 横向长方形（已按 MAP_SCALE=1.5 等比放大）：
+            // 兵线在北侧横贯左右，南侧一道堤墙把它与野区分开，
+            // 纵向河道沿中轴 x=0 把南侧野区切成左右两半。
             map: MapDef {
                 id: "ashrift".into(),
                 display_name: "灰界裂谷".into(),
-                width: 100.0,
-                height: 100.0,
-                causeway_half_width: 6.0,
-                source_core_blue: [-76.0, 0.0, 20.0],
-                source_core_red: [76.0, 0.0, 20.0],
-                vision_sources: vec![[-40.0, 0.0, 0.0], [0.0, 0.0, 0.0], [40.0, 0.0, 0.0]],
+                width: 480.0,
+                height: 240.0,
+                causeway_half_width: 12.0,
+                source_core_blue: [-210.0, 0.0, -60.0],
+                source_core_red: [210.0, 0.0, -60.0],
+                vision_sources: vec![[-168.0, 0.0, -48.0], [0.0, 0.0, 12.0], [168.0, 0.0, -48.0]],
                 brush_zones: vec![BrushZone {
-                    center: [-20.0, 0.0, 24.0],
+                    center: [-36.0, 0.0, -12.0],
                     radius: 6.0,
                 }],
             },

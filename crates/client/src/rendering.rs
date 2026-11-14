@@ -1,6 +1,6 @@
 //! 客户端渲染模块
 
-use crate::input::{MoveTargetMarker, SelectedTarget, TargetingState};
+use crate::input::{MoveTargetMarker, PlayerInputState, SelectedTarget, TargetingState};
 use crate::visual::FxShape;
 use crate::{AppState, visual, voxel};
 use bevy::core_pipeline::Core3d;
@@ -60,10 +60,13 @@ pub struct VoxelShard {
     pub max_ttl: f32,
 }
 
-/// 来自网络伤害事件的攻击表现请求（由 `handle_game_event` 入队）
+/// 来自网络伤害事件的表现请求（由 `handle_game_event` 入队）。
+///
+/// `attacker == None` 表示**环境伤害**（河水灼烧）：没有攻击者，只播目标端命中反馈
+/// 与伤害数字，绝不触发挥击 / 刀光 / 弹道，否则会变成「自己打自己」。
 #[derive(Clone, Copy, Debug)]
 pub struct CombatFxRequest {
-    pub attacker: NetId,
+    pub attacker: Option<NetId>,
     pub target: NetId,
     pub damage: f32,
     pub crit: bool,
@@ -73,6 +76,50 @@ pub struct CombatFxRequest {
 /// 这样攻击者 / 目标的位置与阵营都能通过 ECS 查询取得。
 #[derive(Resource, Default)]
 pub struct CombatFxQueue(pub Vec<CombatFxRequest>);
+
+/// 世界空间飘字（伤害数字 / 环境伤害）。以 `NetId` 为锚点而不是冻结出生时的坐标，
+/// 因此目标移动时数字会跟着走。由网络层 / 攻击表现系统入队，egui HUD 层投影绘制。
+#[derive(Clone, Debug)]
+pub struct FloatingText {
+    pub anchor: NetId,
+    /// 相对锚点的初始高度
+    pub height: f32,
+    pub text: String,
+    pub ttl: f32,
+    pub max_ttl: f32,
+    pub color: [u8; 3],
+}
+
+/// 飘字队列，`draw_floating_texts` 每帧推进生命周期并绘制。
+#[derive(Resource, Default)]
+pub struct FloatingTexts(pub Vec<FloatingText>);
+
+impl FloatingTexts {
+    /// 在目标头顶压入一条飘字；同屏最多 40 条，避免混战时刷屏。
+    pub fn push(anchor: NetId, text: impl Into<String>, color: [u8; 3]) -> FloatingText {
+        FloatingText {
+            anchor,
+            height: 2.6,
+            text: text.into(),
+            ttl: 0.9,
+            max_ttl: 0.9,
+            color,
+        }
+    }
+
+    pub fn spawn(&mut self, text: FloatingText) {
+        const MAX_FLOATING_TEXTS: usize = 40;
+        self.0.push(text);
+        if self.0.len() > MAX_FLOATING_TEXTS {
+            let overflow = self.0.len() - MAX_FLOATING_TEXTS;
+            self.0.drain(..overflow);
+        }
+    }
+}
+
+/// 本地普攻起手节流：按英雄攻速控制挥击节奏，与服务端攻击冷却同频但不等同。
+#[derive(Resource, Default)]
+pub struct LocalSwingCooldown(pub f32);
 
 /// 目标选中指示环（右键锁定目标时出现）
 #[derive(Component)]
@@ -165,12 +212,41 @@ pub struct HealthBarLag {
 #[derive(Component)]
 pub struct HealthBarAttached;
 
+/// 英雄阵亡可视状态：挂在父实体上，父实体 `Visibility::Hidden` 会连带隐藏全部方块子节点。
+/// 由权威快照（health<=0）与 `HeroDeath` 关键事件共同驱动，重生时移除。
+#[derive(Component)]
+pub struct DeadHero;
+
+/// 非英雄实体的血条数据源：由权威快照每帧刷新，让野怪 / 小兵 / 哨塔都能显示血条。
+/// `y_offset` 是血条相对实体原点的高度（野怪比英雄高、小兵比英雄矮）。
+#[derive(Component, Clone, Copy, Debug)]
+pub struct WorldHealthBar {
+    pub health: f32,
+    pub max_health: f32,
+    pub y_offset: f32,
+}
+
+/// 血条尺寸 / 英雄默认挂高。
+const BAR_W: f32 = 3.4;
+const BAR_H: f32 = 0.46;
+const BAR_Y: f32 = 4.3;
+
+/// 统一取出 (当前血量, 最大血量, 挂高)：英雄走 `Hero`，其余实体走 `WorldHealthBar`。
+fn health_source(hero: Option<&Hero>, world: Option<&WorldHealthBar>) -> Option<(f32, f32, f32)> {
+    if let Some(h) = hero {
+        return Some((h.health, h.max_health, BAR_Y));
+    }
+    world.map(|w| (w.health, w.max_health, w.y_offset))
+}
+
 pub struct RenderingPlugin;
 
 impl Plugin for RenderingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SelectedTarget>()
             .init_resource::<CombatFxQueue>()
+            .init_resource::<FloatingTexts>()
+            .init_resource::<LocalSwingCooldown>()
             .init_resource::<EventFxQueue>()
             .init_resource::<crate::visual::VoxelMaterialPool>()
             // 启动期只建相机与灯光（供 egui 主上下文）；游戏世界延迟到进入对局。
@@ -180,9 +256,12 @@ impl Plugin for RenderingPlugin {
             .add_systems(
                 Update,
                 (
+                    sync_hero_death_visuals,
                     update_health_bars,
                     camera_follow_local_player,
                     tick_hit_flash,
+                    // 本地起手必须先于服务端命中表现，后者到达时刷新挥击计时。
+                    local_attack_anticipation,
                     spawn_combat_fx,
                     // 英雄动画链：先推速度 → 既有挥击动画 → 状态机写骨架姿态。
                     // 严格顺序保证 Attack 态双臂不被状态机覆盖。
@@ -345,10 +424,79 @@ fn camera_follow_local_player(
 
 /// 为每个有生命的英雄（本地玩家、敌方英雄、训练假人）生成世界空间血条；
 /// 死亡或实体消失后自动移除。血条始终朝向相机，蓝队绿、红队红。
+/// 阵亡可视体同步：血量为 0 的英雄整株隐藏，重生时恢复并播放「方块重组」。
+///
+/// 以**权威快照**为准，且兼容视野裁剪：快照里没有该英雄时保持现状，
+/// 不会因为「敌人暂时离开视野」而把尸体重新显示出来。
+/// 父实体 `Visibility::Hidden` 会经 `InheritedVisibility` 连带隐藏全部躯干/四肢子节点。
+pub fn sync_hero_death_visuals(
+    mut commands: Commands,
+    snapshot: Option<Res<crate::networking::ReceivedSnapshot>>,
+    mut heroes: Query<
+        (
+            Entity,
+            &NetId,
+            &Hero,
+            Option<&DeadHero>,
+            Option<&mut crate::hero_anim::HeroAnim>,
+        ),
+        With<Hero>,
+    >,
+) {
+    let Some(snapshot) = snapshot else { return };
+    if snapshot.0.tick == 0 {
+        return;
+    }
+    let health: std::collections::HashMap<u64, f32> = snapshot
+        .0
+        .entities
+        .iter()
+        .filter(|e| e.entity_type == game_core::net::EntityType::Hero)
+        .map(|e| (e.net_id.0, e.health))
+        .collect();
+
+    for (entity, net_id, hero, dead_marker, mut anim) in heroes.iter_mut() {
+        // 快照缺失（视野裁剪）时沿用本地已同步的血量，避免状态抖动。
+        let dead = health.get(&net_id.0).copied().unwrap_or(hero.health) <= 0.0;
+        if dead {
+            if dead_marker.is_none() {
+                commands.entity(entity).insert((
+                    DeadHero,
+                    Visibility::Hidden,
+                    crate::hero_anim::DeathAnim { t: 1.2 },
+                ));
+            }
+        } else if dead_marker.is_some() {
+            commands
+                .entity(entity)
+                .insert(Visibility::Inherited)
+                .remove::<DeadHero>()
+                .remove::<crate::hero_anim::DeathAnim>();
+            if let Some(a) = anim.as_deref_mut() {
+                a.state = crate::hero_anim::HeroAnimState::Respawn;
+                a.phase = 0.0;
+                a.speed = 0.0;
+            }
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
 fn update_health_bars(
     mut commands: Commands,
     time: Res<Time>,
-    heroes: Query<(Entity, &Hero, Option<&Team>), Without<HealthBarAttached>>,
+    targets: Query<
+        (
+            Entity,
+            Option<&Hero>,
+            Option<&WorldHealthBar>,
+            Option<&Team>,
+        ),
+        (
+            Or<(With<Hero>, With<WorldHealthBar>)>,
+            Without<HealthBarAttached>,
+        ),
+    >,
     mut bars: Query<
         (Entity, &mut Transform, &HealthBar, &mut Visibility),
         (Without<HealthBarFill>, Without<HealthBarLag>),
@@ -361,21 +509,24 @@ fn update_health_bars(
         (Entity, &mut Transform, &mut Visibility, &mut HealthBarLag),
         (Without<HealthBar>, Without<HealthBarFill>),
     >,
-    hero_query: Query<(&GlobalTransform, &Hero)>,
+    owner_query: Query<
+        (&GlobalTransform, Option<&Hero>, Option<&WorldHealthBar>),
+        Or<(With<Hero>, With<WorldHealthBar>)>,
+    >,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    const BAR_W: f32 = 3.4;
-    const BAR_H: f32 = 0.46;
-    const BAR_Y: f32 = 4.3;
     // 血条垂直于相机视线：绕 X 轴旋转固定俯角，沿法线方向叠放背景 / 残影 / 填充
     let len = CAMERA_OFFSET.yz().length();
     let billboard = Quat::from_rotation_x(-CAMERA_OFFSET.y.atan2(CAMERA_OFFSET.z));
     let normal = Vec3::new(0.0, CAMERA_OFFSET.y / len, CAMERA_OFFSET.z / len);
 
-    // 1) 为尚无血条的英雄创建血条（背景条 + 残影条 + 填充条，均为独立实体便于清理）
-    for (entity, hero, team) in heroes.iter() {
-        if hero.health <= 0.0 {
+    // 1) 为尚无血条的目标创建血条（英雄 / 野怪 / 小兵 / 哨塔统一走这里）
+    for (entity, hero, world, team) in targets.iter() {
+        let Some((hp, _, bar_y)) = health_source(hero, world) else {
+            continue;
+        };
+        if hp <= 0.0 {
             continue;
         }
         let fill_color = match team {
@@ -396,7 +547,7 @@ fn update_health_bars(
                     unlit: true,
                     ..default()
                 })),
-                Transform::from_translation(Vec3::new(0.0, BAR_Y, 0.0)),
+                Transform::from_translation(Vec3::new(0.0, bar_y, 0.0)),
                 Visibility::Visible,
             ))
             .id();
@@ -410,7 +561,7 @@ fn update_health_bars(
                     unlit: true,
                     ..default()
                 })),
-                Transform::from_translation(Vec3::new(0.0, BAR_Y, 0.0)),
+                Transform::from_translation(Vec3::new(0.0, bar_y, 0.0)),
                 Visibility::Visible,
             ))
             .id();
@@ -423,50 +574,58 @@ fn update_health_bars(
                 unlit: true,
                 ..default()
             })),
-            Transform::from_translation(Vec3::new(0.0, BAR_Y, 0.0)),
+            Transform::from_translation(Vec3::new(0.0, bar_y, 0.0)),
             Visibility::Visible,
         ));
-        // 标记英雄已绑定血条，避免后续帧重复生成
+        // 标记目标已绑定血条，避免后续帧重复生成
         commands.entity(entity).insert(HealthBarAttached);
     }
 
     // 2) 同步存活血条：跟随目标 + 固定朝向相机
     for (e, mut transform, healthbar, mut visibility) in bars.iter_mut() {
-        let Ok((hero_gt, hero)) = hero_query.get(healthbar.entity) else {
-            // 英雄实体已消失（死亡被销毁），移除血条、残影与填充条
+        let Ok((owner_gt, hero, world)) = owner_query.get(healthbar.entity) else {
+            // 目标实体已消失（死亡被销毁），移除血条、残影与填充条
             commands.entity(e).despawn();
             commands.entity(healthbar.fill).despawn();
             commands.entity(healthbar.lag).despawn();
             continue;
         };
-        if hero.health <= 0.0 {
+        let Some((hp, _, bar_y)) = health_source(hero, world) else {
+            *visibility = Visibility::Hidden;
+            continue;
+        };
+        if hp <= 0.0 {
             *visibility = Visibility::Hidden;
             continue;
         }
         *visibility = Visibility::Visible;
-        transform.translation = hero_gt.translation() + Vec3::Y * BAR_Y;
+        transform.translation = owner_gt.translation() + Vec3::Y * bar_y;
         transform.rotation = billboard;
     }
 
     // 3) 填充条：跟随目标 + 按血量比例缩放（左缘固定，从右向左缩减）
     for (_e, mut tr, mut vis, fill) in fills.iter_mut() {
-        let Ok((hero_gt, hero)) = hero_query.get(fill.hero) else {
+        let Ok((owner_gt, hero, world)) = owner_query.get(fill.hero) else {
             *vis = Visibility::Hidden;
             continue;
         };
-        if hero.health <= 0.0 {
+        let Some((hp, max_hp, bar_y)) = health_source(hero, world) else {
+            *vis = Visibility::Hidden;
+            continue;
+        };
+        if hp <= 0.0 {
             *vis = Visibility::Hidden;
             continue;
         }
         *vis = Visibility::Visible;
-        let ratio = if hero.max_health > 0.0 {
-            (hero.health / hero.max_health).clamp(0.0, 1.0)
+        let ratio = if max_hp > 0.0 {
+            (hp / max_hp).clamp(0.0, 1.0)
         } else {
             0.0
         };
         // 左缘锚定：平移使左侧边不动，右侧随比例缩短，避免中心收缩的视觉异常
-        tr.translation = hero_gt.translation()
-            + Vec3::Y * BAR_Y
+        tr.translation = owner_gt.translation()
+            + Vec3::Y * bar_y
             + normal * 0.024
             + Vec3::X * (-BAR_W * (1.0 - ratio) / 2.0);
         tr.rotation = billboard;
@@ -476,25 +635,29 @@ fn update_health_bars(
     // 4) 残影条：只会在受伤后缓慢收缩，便于看清本次掉血
     let dt = time.delta_secs();
     for (_e, mut tr, mut vis, mut lag) in lags.iter_mut() {
-        let Ok((hero_gt, hero)) = hero_query.get(lag.hero) else {
+        let Ok((owner_gt, hero, world)) = owner_query.get(lag.hero) else {
             *vis = Visibility::Hidden;
             continue;
         };
-        if hero.health <= 0.0 {
+        let Some((hp, max_hp, bar_y)) = health_source(hero, world) else {
+            *vis = Visibility::Hidden;
+            continue;
+        };
+        if hp <= 0.0 {
             *vis = Visibility::Hidden;
             continue;
         }
         *vis = Visibility::Visible;
-        let ratio = if hero.max_health > 0.0 {
-            (hero.health / hero.max_health).clamp(0.0, 1.0)
+        let ratio = if max_hp > 0.0 {
+            (hp / max_hp).clamp(0.0, 1.0)
         } else {
             0.0
         };
         // 残影收回速度：0→1 的满血条大约 1 秒内追平
         lag.shown = (lag.shown - dt * 0.9).max(ratio);
         lag.shown = lag.shown.max(ratio).min(1.0);
-        tr.translation = hero_gt.translation()
-            + Vec3::Y * BAR_Y
+        tr.translation = owner_gt.translation()
+            + Vec3::Y * bar_y
             + normal * 0.012
             + Vec3::X * (-BAR_W * (1.0 - lag.shown) / 2.0);
         tr.rotation = billboard;
@@ -527,6 +690,81 @@ fn tick_hit_flash(
     }
 }
 
+/// 本地普攻起手：**不等待服务端命中回包**，按住普攻键就按攻速挥臂并甩出一道短刀光。
+///
+/// 旧实现里挥击、刀光、弹道全部由 `DamageDealt` 事件驱动，而 `attack_system` 只有在
+/// 「射程内有目标并造成伤害」时才产生该事件 —— 右键锁定后若目标还差几步、或打空了，
+/// 玩家看不到任何攻击动作；就算命中，也要等一整个 RTT 才播。这就是「看不出如何攻击」的根因。
+/// 这里用本地输入做即时起手，命中后的完整刀光 / 弹道 / 伤害数字仍由服务端事件负责，
+/// 两条链路互为补充（重复 insert `AttackAnim` 只是刷新计时，不会叠加动画）。
+fn local_attack_anticipation(
+    time: Res<Time>,
+    input: Option<Res<PlayerInputState>>,
+    selected: Res<SelectedTarget>,
+    mut cooldown: ResMut<LocalSwingCooldown>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    heroes: Query<(Entity, &GlobalTransform, &Hero), With<LocalPlayer>>,
+    units: Query<(&NetId, &GlobalTransform)>,
+) {
+    cooldown.0 = (cooldown.0 - time.delta_secs()).max(0.0);
+    // 只挂渲染插件的最小夹具里没有输入资源，此时不应 panic。
+    let Some(input) = input else {
+        return;
+    };
+    let Some((entity, gt, hero)) = heroes.iter().next() else {
+        return;
+    };
+    if input.dead || hero.health <= 0.0 || input.ability_mask & 0b0001 == 0 || cooldown.0 > 0.0 {
+        return;
+    }
+    let period = 1.0 / hero.attack_speed.max(0.1);
+    cooldown.0 = period;
+    let duration = (period * 0.75).clamp(0.18, 0.34);
+    commands.entity(entity).insert(AttackAnim {
+        t: duration,
+        duration,
+    });
+
+    let origin = gt.translation();
+    // 锁定了目标就朝目标挥，否则朝鼠标落点挥；两者都无效时默认朝 +X。
+    let aim = selected
+        .0
+        .and_then(|tid| {
+            units
+                .iter()
+                .find(|(n, _)| n.0 == tid.0)
+                .map(|(_, t)| t.translation())
+        })
+        .unwrap_or_else(|| Vec3::new(input.aim_dir.x, 0.0, input.aim_dir.y));
+    let flat = Vec2::new(aim.x - origin.x, aim.z - origin.z);
+    let forward = if flat.length() > 1e-3 {
+        flat.normalize()
+    } else {
+        Vec2::X
+    };
+    let yaw = forward.y.atan2(forward.x);
+    commands.spawn((
+        SlashArc {
+            t: 0.16,
+            max: 0.16,
+            center_yaw: -yaw,
+        },
+        Mesh3d(meshes.add(Cuboid::new(1.9, 0.1, 0.35))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.85, 0.92, 1.0),
+            emissive: Color::srgb(0.25, 0.30, 0.38).into(),
+            unlit: true,
+            ..default()
+        })),
+        Transform::from_translation(
+            origin + Vec3::new(forward.x, 0.0, forward.y) * 1.6 + Vec3::Y * 1.6,
+        )
+        .with_rotation(Quat::from_rotation_y(-yaw - 1.15)),
+    ));
+}
+
 /// 消费攻击表现队列：触发攻击者的挥击动画，并按距离生成刀光或弹道。
 ///
 /// 相比之前“对比血量推断攻击者”的做法，这里直接使用服务端 DamageDealt 事件携带的
@@ -534,6 +772,7 @@ fn tick_hit_flash(
 fn spawn_combat_fx(
     mut commands: Commands,
     mut queue: ResMut<CombatFxQueue>,
+    mut texts: ResMut<FloatingTexts>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     units: Query<(
@@ -549,11 +788,29 @@ fn spawn_combat_fx(
     }
     let requests = std::mem::take(&mut queue.0);
     for req in requests {
-        let attacker = units.iter().find(|u| *u.1 == req.attacker);
         let target = units.iter().find(|u| *u.1 == req.target);
 
         let Some(target) = target else { continue };
         let target_pos = target.2.translation();
+
+        let Some(attacker_id) = req.attacker else {
+            // 环境伤害：没有攻击者，只播目标端的命中火花 + 冷蓝色伤害数字。
+            // 绝不生成挥击 / 刀光 / 弹道，否则会变成「自己打自己」。
+            spawn_impact_burst(
+                &mut commands,
+                &mut meshes,
+                &mut materials,
+                target_pos + Vec3::Y * 1.3,
+                Color::srgb(0.35, 0.75, 1.0),
+            );
+            texts.spawn(FloatingTexts::push(
+                req.target,
+                damage_label(req.damage, false),
+                [96, 200, 255],
+            ));
+            continue;
+        };
+        let attacker = units.iter().find(|u| *u.1 == attacker_id);
 
         let Some(attacker) = attacker else {
             // 攻击者不在客户端可见集合内（防御塔 / 视野外），只保留目标端反馈
@@ -564,6 +821,11 @@ fn spawn_combat_fx(
                 target_pos + Vec3::Y * 1.3,
                 impact_color(Team::Neutral),
             );
+            texts.spawn(FloatingTexts::push(
+                req.target,
+                damage_label(req.damage, req.crit),
+                damage_color(req.crit, Team::Neutral),
+            ));
             continue;
         };
         let (attacker_entity, _, attacker_gt, attacker_team, attacker_hero) = attacker;
@@ -655,7 +917,39 @@ fn spawn_combat_fx(
                     .with_rotation(Quat::from_rotation_y(-yaw - 1.15)),
             ));
         }
-        let _ = req.damage;
+        // 命中确认：把 `CombatFxRequest.damage` 真正显示出来。
+        // 旧实现 `let _ = req.damage;` 把伤害数字丢掉，玩家只能靠血条缓慢下降猜有没有打中。
+        texts.spawn(FloatingTexts::push(
+            req.target,
+            damage_label(req.damage, req.crit),
+            damage_color(req.crit, attacker_team),
+        ));
+    }
+}
+
+/// 伤害数字文案。暴击加 `!`，小数伤害保留 1 位以便看到环境 DoT 之类的细小额。
+fn damage_label(damage: f32, crit: bool) -> String {
+    let n = if damage < 10.0 && damage.fract() > 1e-3 {
+        format!("{damage:.1}")
+    } else {
+        format!("{:.0}", damage.round())
+    };
+    if crit {
+        format!("-{n}!")
+    } else {
+        format!("-{n}")
+    }
+}
+
+fn damage_color(crit: bool, team: Team) -> [u8; 3] {
+    if crit {
+        [255, 176, 64]
+    } else {
+        match team {
+            Team::Blue => [150, 214, 255],
+            Team::Red => [255, 148, 128],
+            Team::Neutral => [255, 226, 140],
+        }
     }
 }
 
@@ -1190,5 +1484,64 @@ mod pv3_tests {
             q.iter(app.world()).next().is_none(),
             "lobby startup must not render the match world"
         );
+    }
+
+    /// 伤害数字文案：暴击带 `!`，小数伤害保留一位（环境 DoT 会用到）。
+    #[test]
+    fn damage_labels_are_readable() {
+        assert_eq!(damage_label(120.0, false), "-120");
+        assert_eq!(damage_label(120.4, false), "-120");
+        assert_eq!(damage_label(120.0, true), "-120!");
+        assert_eq!(damage_label(7.5, false), "-7.5");
+        assert_eq!(damage_label(0.0, false), "-0");
+        assert_ne!(
+            damage_color(true, Team::Blue),
+            damage_color(false, Team::Blue)
+        );
+        assert_ne!(
+            damage_color(false, Team::Blue),
+            damage_color(false, Team::Red)
+        );
+    }
+
+    /// 飘字以 NetId 为锚点（目标移动时数字跟着走），且同屏数量有预算裁剪。
+    #[test]
+    fn floating_texts_are_anchored_and_budgeted() {
+        let id = NetId(42);
+        let ft = FloatingTexts::push(id, "-25", [96, 200, 255]);
+        assert_eq!(ft.anchor.0, id.0);
+        assert_eq!(ft.text, "-25");
+        assert!(ft.ttl > 0.0 && ft.max_ttl >= ft.ttl);
+
+        let mut texts = FloatingTexts::default();
+        for i in 0..64 {
+            texts.spawn(FloatingTexts::push(
+                NetId(i),
+                format!("-{i}"),
+                [255, 255, 255],
+            ));
+        }
+        assert_eq!(texts.0.len(), 40, "同屏飘字必须有上限");
+        assert_eq!(texts.0.last().unwrap().anchor.0, 63, "裁剪应保留最新的飘字");
+    }
+
+    /// 环境伤害请求的 `attacker` 必须为 None，否则渲染层会误播一次攻击挥击。
+    #[test]
+    fn environment_damage_has_no_attacker() {
+        let req = CombatFxRequest {
+            attacker: None,
+            target: NetId(7),
+            damage: 25.0,
+            crit: false,
+        };
+        assert!(req.attacker.is_none());
+        assert!(!req.crit);
+        let normal = CombatFxRequest {
+            attacker: Some(NetId(1)),
+            target: NetId(7),
+            damage: 120.0,
+            crit: false,
+        };
+        assert_eq!(normal.attacker, Some(NetId(1)));
     }
 }

@@ -24,17 +24,17 @@ pub fn in_brush(position: [f32; 3]) -> bool {
     })
 }
 
-/// 为单个玩家计算可见实体集合。
+/// 单个玩家的**可见源**（VIS-3/4）：己方英雄恒为源，塔 / 小兵受策略开关控制。
 ///
-/// - VIS-2：己方阵营实体始终可见；
-/// - VIS-3/4：敌方与中立实体须落在己方可见源半径内；
-/// - VIS-5：遮蔽区内使用更小的 `brush_reveal_radius`。
-pub fn compute_visibility(
+/// 客户端战争迷雾直接复用本函数的结果（由服务端逐玩家下发），因此遮罩口径与
+/// `compute_visibility` 的实体裁剪**严格一致**，不会出现「看得见敌人但地图是黑的」
+/// 或「地图亮着却收不到敌人」。
+pub fn vision_sources(
     viewer_team: Team,
     policy: &VisibilityPolicy,
     entities: &[EntitySnapshot],
-) -> VisibilitySet {
-    let sources: Vec<[f32; 3]> = entities
+) -> Vec<[f32; 3]> {
+    entities
         .iter()
         .filter(|e| {
             if e.team != viewer_team {
@@ -48,10 +48,36 @@ pub fn compute_visibility(
             }
         })
         .map(position_of)
-        .collect();
+        .collect()
+}
 
+/// 为单个玩家计算可见实体集合。
+///
+/// - VIS-2：己方阵营实体始终可见；
+/// - VIS-3/4：敌方与中立实体须落在己方可见源半径内；
+/// - VIS-5：遮蔽区内使用更小的 `brush_reveal_radius`。
+pub fn compute_visibility(
+    viewer_team: Team,
+    policy: &VisibilityPolicy,
+    entities: &[EntitySnapshot],
+) -> VisibilitySet {
+    let sources = vision_sources(viewer_team, policy, entities);
     let mut visible = Vec::with_capacity(entities.len());
     for e in entities {
+        // 野怪是固定地图设施（营地点已知、不会移动出区域），必须始终下发：
+        // 否则 18 单位视野外的营地既看不到模型、也无法锁定攻击，更没有血条。
+        if e.entity_type == EntityType::JungleMonster {
+            visible.push(e.net_id.0);
+            continue;
+        }
+        // 阵亡英雄会被立即吸附到已方泉水（远离交战点）。若按常规视野裁剪，
+        // 击杀者收不到 health=0 的快照、HeroDeath 事件也会被 event_visible 丢弃，
+        // 于是客户端的敌方模型永远停在死亡位置 —— 正是「血打完人不消失」。
+        // 尸体位置只有泉水这一公开信息，强制下发 health=0 不会泄露战术信息。
+        if e.entity_type == EntityType::Hero && e.health <= 0.0 {
+            visible.push(e.net_id.0);
+            continue;
+        }
         if e.team == viewer_team {
             visible.push(e.net_id.0);
             continue;
@@ -122,7 +148,7 @@ mod tests {
     fn own_team_always_visible() {
         let ents = vec![
             entity(1, Team::Blue, EntityType::Hero, 0.0, 0.0),
-            entity(2, Team::Blue, EntityType::Hero, 90.0, 90.0),
+            entity(2, Team::Blue, EntityType::Hero, 140.0, -40.0),
         ];
         let set = compute_visibility(Team::Blue, &policy(), &ents);
         assert!(set.contains(1));
@@ -134,19 +160,56 @@ mod tests {
         let ents = vec![
             entity(1, Team::Blue, EntityType::Hero, 0.0, 0.0),
             entity(2, Team::Red, EntityType::Hero, 5.0, 0.0),
-            entity(3, Team::Red, EntityType::Hero, 100.0, 0.0),
+            entity(3, Team::Red, EntityType::Hero, 140.0, 0.0),
         ];
         let set = compute_visibility(Team::Blue, &policy(), &ents);
         assert!(set.contains(2));
         assert!(!set.contains(3));
     }
 
+    /// 阵亡英雄被吸附到远处泉水后，仍必须下发 health=0，客户端才能隐藏其模型。
+    #[test]
+    fn dead_enemy_hero_is_always_visible() {
+        // 阵亡英雄被服务端吸附到红方泉水 `(140,-40)`，远离击杀者视野
+        let mut dead = entity(3, Team::Red, EntityType::Hero, 140.0, -40.0);
+        dead.health = 0.0;
+        let ents = vec![
+            entity(1, Team::Blue, EntityType::Hero, 0.0, 0.0),
+            dead,
+            // 对照组：活着的远处敌人仍应被裁剪
+            entity(4, Team::Red, EntityType::Hero, 140.0, -30.0),
+        ];
+        let set = compute_visibility(Team::Blue, &policy(), &ents);
+        assert!(set.contains(3), "阵亡英雄必须下发，否则客户端看不到死亡");
+        assert!(!set.contains(4), "存活的远处敌人仍应被裁剪");
+    }
+
+    /// 野怪是静态地图设施：即使远在视野外，也必须下发，否则客户端无法建模 / 锁定 / 显示血条。
+    #[test]
+    fn jungle_monsters_are_always_visible() {
+        let ents = vec![
+            entity(1, Team::Blue, EntityType::Hero, 0.0, 0.0),
+            entity(2, Team::Neutral, EntityType::JungleMonster, 120.0, 60.0),
+            // 对照组：同样距离的中立实体仍受视野裁剪
+            entity(3, Team::Neutral, EntityType::Minion, 120.0, 60.0),
+        ];
+        let set = compute_visibility(Team::Blue, &policy(), &ents);
+        assert!(set.contains(2), "远处野怪必须可见");
+        assert!(!set.contains(3), "视野裁剪仍应对其他中立实体生效");
+    }
+
     #[test]
     fn brush_requires_smaller_radius() {
-        // BUSHES 含 (-24,0,-8) r=4；把敌方放在草丛边沿，8 单位外（>6 但 <18）
+        // 从真实草丛取坐标（地图等比放大后硬编码的 -24/-8 会失效）：
+        // 敌人站在草丛中心，观察者在 8 单位外（> brush_reveal_radius=6，但 < 普通视野 18）。
+        let b = BUSHES
+            .iter()
+            .find(|b| b.center.x < 0.0)
+            .expect("地图必须有蓝方半区草丛");
+        let (cx, cz) = (b.center.x, b.center.z);
         let ents = vec![
-            entity(1, Team::Blue, EntityType::Hero, -24.0, -16.0),
-            entity(2, Team::Red, EntityType::Hero, -24.0, -8.0),
+            entity(1, Team::Blue, EntityType::Hero, cx, cz - 8.0),
+            entity(2, Team::Red, EntityType::Hero, cx, cz),
         ];
         let set = compute_visibility(Team::Blue, &policy(), &ents);
         assert!(!set.contains(2), "brush-hidden enemy must not be visible");

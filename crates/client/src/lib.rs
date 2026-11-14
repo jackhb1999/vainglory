@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod entity_visual;
+pub mod fog;
 pub mod hero_anim;
 pub mod input;
 pub mod interpolation;

@@ -463,6 +463,21 @@ pub enum GameEvent {
         duration_ticks: u64,
         event_id: EventId,
     },
+    /// 环境伤害（当前用于河道浅滩灼烧）：**没有攻击者**，因此不能复用 `DamageDealt`
+    /// —— 后者会驱动攻击者的挥击 / 刀光，造成「自己打自己」的错误表现。
+    /// `kind` 预留给后续环境危害，0 = 河水灼烧。
+    EnvironmentDamage {
+        target: NetId,
+        damage: f32,
+        kind: u8,
+    },
+    /// 兵矿（辉矿）归属期间的周期收益，供 HUD 飘字；金币本身由 `CH_GOLD` 快照裁决。
+    /// **追加在枚举末尾**：bitcode 按下标编码，插在中间会平移既有变体判别值。
+    ObjectiveIncome {
+        owner: Team,
+        amount: u32,
+        event_id: EventId,
+    },
 }
 
 impl GameEvent {
@@ -511,6 +526,7 @@ impl GameEvent {
             GameEvent::DamageDealt {
                 attacker, target, ..
             } => vec![attacker.0, target.0],
+            GameEvent::EnvironmentDamage { target, .. } => vec![target.0],
             GameEvent::JungleMonsterDeath { net_id, killer, .. } => vec![net_id.0, killer.0],
             GameEvent::Ping { from, .. } => vec![from.0],
             _ => Vec::new(),
@@ -536,6 +552,7 @@ impl GameEvent {
                 | GameEvent::WaveSpawned { .. }
                 | GameEvent::OvertimeStarted { .. }
                 | GameEvent::MatchFinished { .. }
+                | GameEvent::ObjectiveIncome { .. }
         )
     }
 }
@@ -648,6 +665,25 @@ pub enum ServerMessage {
         net_id: NetId,
         team: Team,
         snapshot: WorldSnapshot,
+    },
+    /// `NAV-M2-01` 全局动态障碍视图 + 权威网格版本（C1/C8）。
+    /// 走 ReliableOrdered：必须保证客户端拿得到，且**不经逐玩家视野裁剪** ——
+    /// 视野外的哨塔同样要进 A* walls，否则会规划出穿塔路径。
+    ///
+    /// **追加在枚举末尾**：bitcode 枚举按下标编码，插在中间会平移所有既有变体的
+    /// 判别值、让旧构建收到的 Welcome / Snapshot 全部解码失败。
+    NavGridUpdate {
+        snapshot: crate::navgrid::NavObstacleSnapshot,
+        version: u32,
+    },
+    /// 战争迷雾（VIS-1~9）：**逐玩家**下发该玩家的可见源与有效视野半径。
+    /// 客户端不自行从渲染实体推断视野，遮罩因此与服务端实体裁剪严格同源。
+    /// 走 Unreliable：偶发丢包只让迷雾晚一帧变亮，不值得占用可靠通道。
+    VisionUpdate {
+        sources: Vec<[f32; 2]>,
+        vision_radius: f32,
+        brush_reveal_radius: f32,
+        server_tick: u64,
     },
 }
 

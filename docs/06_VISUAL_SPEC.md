@@ -11,6 +11,36 @@
 > 本文是 P-V0 的交付物，也是 P-V1 / P-V2 / P-V3 的**唯一口径来源**。
 > 后续阶段若发现与本规范冲突，必须先修订本规范并同步 `README.md` / §16 / 资产登记表，再继续实现。
 
+> **文档族（GX-01）**：本文档与下列文档共享同一套 ID 前缀（`FR`/`NFR`/`CR`/`UC`/`DEV`/`TC`/`GAP`/`ARC`/`ADR`/`TA`/`TF`/`DN`/`TR`），禁止各自另起编号；术语以 `docs/02_ARCHITECTURE.md` §2.1 为准。
+>
+> | 文档 | 编号 | 文件 |
+> |---|---|---|
+> | 技术可行性 | `GX-TF-2026-001` | `docs/01_TECHNICAL_FEASIBILITY.md` |
+> | 系统架构 | `GX-ARCH-2026-001` | `docs/02_ARCHITECTURE.md` |
+> | 需求规格 | `GX-PRD-2026-001` | `docs/03_REQUIREMENTS.md` |
+> | 开发实施 | `GX-DEV-2026-001` | `docs/04_DEVELOPMENT.md` |
+> | 对战详细规格 | `GX-CBT-2026-001` | `docs/05_COMBAT_SPEC.md` |
+> | 表现层规范 | `GX-VIS-2026-001` | `docs/06_VISUAL_SPEC.md` |
+> | 上游可行性研究（合规留档，非本项目原创内容） | `VG-FS-2026-001` | `docs/VAINGLORY_FEASIBILITY_STUDY.md` |
+> | 资产登记 | `GX-ASSET-REG-2026-001` | `ASSET_REGISTRY.md` |
+> | 表达层禁用词 | — | `docs/TERM_DENYLIST.txt` |
+
+### 目录
+
+- §1 背景：需要收口的口径冲突
+- §2 视觉方向
+- §3 色彩规范
+- §4 术语口径
+- §5 命名规范
+- §6 四阶段交付标准与验收条件
+- §7 性能约束
+- §8 P-V0 阶段交付
+- §9 P-V1 阶段交付：纹理与材质池
+- §10 P-V2 阶段交付：英雄造型与动画
+- §11 P-V3 阶段交付：技能与事件视觉
+- §12 P-V4 阶段交付：非英雄实体、地形分层与 8-bit 音频
+- §13 P-U1 阶段交付：大厅、英雄档案、道具图鉴与模式选择
+
 ## 1. 背景：需要收口的口径冲突
 
 | 编号 | 旧表述 | 实际情况 | 本次处置 |
@@ -214,7 +244,7 @@ P-V0 不改动运行时行为，只把「视觉方向、美术风格、色彩规
 | V1-09 | 3D 弹体 `Sphere → Cuboid`（PRES-4 违规清零） | 合规修正 | `interpolation.rs::sync_projectiles` |
 | V1-10 | 场景 / 道具 / 角色三类的图案与明暗分配 | 风格落地 | `voxel.rs` 各生成函数 |
 | V1-11 | 6 个新增单测 | 验收用例 | `visual.rs::tests` |
-| V1-12 | 根 / `docs` 两份资产登记表 A-002 / A-005 状态同步 | 文档 | `ASSET_REGISTRY.md`、`docs/ASSET_REGISTRY.md` |
+| V1-12 | 单一 `ASSET_REGISTRY.md`（原根与 `docs/` 两份，已合并）A-002 / A-005 状态同步 | 文档 | `ASSET_REGISTRY.md` |
 
 **资源覆盖矩阵**
 
@@ -516,7 +546,7 @@ P-V0 不改动运行时行为，只把「视觉方向、美术风格、色彩规
 
 | 编号 | 冲突 | 处置 |
 |---|---|---|
-| A-05 | 前四阶段资产表 / `README.md` §8.6 / `docs/05_COMBAT_SPEC.md` §16.4 均写「8-bit 音频零实现 / 待资产」，本阶段变为**已提供** | 两份 `ASSET_REGISTRY.md`、README、§16 全部回写；**门禁要求的「待资产 / 外部依赖」标注仍由 A-006 中文字形条目承担**，不删除、不放宽 |
+| A-05 | 前四阶段资产表 / `README.md` §8.6 / `docs/05_COMBAT_SPEC.md` §16.4 均写「8-bit 音频零实现 / 待资产」，本阶段变为**已提供** | 单一 `ASSET_REGISTRY.md`、README、§16 全部回写；**门禁要求的「待资产 / 外部依赖」标注仍由 A-006 中文字形条目承担**，不删除、不放宽 |
 | A-06 | §16.1 PRES-7 与资产表写「当前无高度层与河道，`PixelKind::Water` 已定义未启用」 | 本阶段启用河道与 7 层高度表，逐处回写；`Water` 从「定义未启用」变为「河道水面」 |
 | A-07 | §11.2.4 明确「高频事件刻意不生成世界空间特效」，音频若逐事件发声会违反同一性能意图 | 音频采用**稀疏显式映射表**（`SFX_EVENT_MAP`），野怪死亡 / 波次 / 状态等高频事件不发声；视觉与听觉共用同一次事件消费 |
 | A-08 | §7 性能预算只覆盖视觉实体 | 新增音频预算：单帧 ≤4 次播放、单音效 ≤0.5 s、采样率 22.05 kHz 单声道、内存 PCM；静态发布包仍无音频二进制 |
@@ -532,7 +562,7 @@ P-V0 不改动运行时行为，只把「视觉方向、美术风格、色彩规
 | V4-05 | `tick_non_hero_anim` 走路摆动 / 待机呼吸 / 核心脉冲 / 血量损伤 | 系统 | 同上 |
 | V4-06 | `spawn_voxel_non_hero` / `spawn_voxel_monster` | 生成函数 | `crates/client/src/voxel.rs` |
 | V4-07 | 哨塔 / 源核静态堆叠改父子骨架（不再是死装饰） | 几何改造 | `spawn_voxel_stack` |
-| V4-08 | `RIVER_HALF_WIDTH = 6.0` 权威河道半宽 | 地图常量 | `crates/game-core/src/map.rs` |
+| V4-08 | 权威河道半宽（当时值 6.0；现由 `8.0 × MAP_SCALE = 12.0` 派生） | 地图常量 | `crates/game-core/src/map.rs` |
 | V4-09 | `TerrainLayer` + `TERRAIN_LAYERS[7]` 有序高度层表 | 资源类型 / 数据表 | `crates/client/src/voxel.rs` |
 | V4-10 | 下沉河床 / 水面 / 河岸三档 + 地面区间减法（水平不重叠） | 地形生成 | `spawn_voxel_terrain` |
 | V4-11 | 地面拼贴共享单位 `Cuboid` + `with_scale` 合批 | 性能优化 | 同上 |
@@ -566,17 +596,32 @@ P-V0 不改动运行时行为，只把「视觉方向、美术风格、色彩规
 |---|---|---|---|---|
 | `LAYER_RIVER_BED` | -0.55 | 0.30 | -0.40 | 下沉河床 |
 | `LAYER_WATER` | -0.30 | 0.10 | -0.25 | 河道水面（`PixelKind::Water`） |
-| `LAYER_GROUND` | -0.25 | 0.40 | -0.05 | 12×12 草 / 土棋盘 |
-| `LAYER_FOLD` | -0.02 | 0.07 | 0.015 | 折叠线 |
-| `LAYER_BANK` | 0.03 | 0.14 | 0.10 | 河岸石条 |
-| `LAYER_LANE` | 0.12 | 0.07 | 0.155 | 三路兵线条带 |
+| `LAYER_GROUND` | -0.25 | 0.40 | -0.05 | 32×16 草 / 土棋盘（2:1 长方形） |
+| `LAYER_FOLD` | -0.02 | 0.07 | 0.015 | 兵线跨河的桥面石台 |
+| `LAYER_BANK` | 0.03 | 0.14 | 0.10 | 纵向河岸石条（两条） |
+| `LAYER_LANE` | 0.12 | 0.07 | 0.155 | 单条水平兵线条带 |
 | `LAYER_WAYPOINT` | 0.20 | 0.05 | 0.225 | 路点补缝 |
 
 > 相邻层顶面间隔 ≥ 0.05（单测锁定），顶面严格递增。
-> 河道 `|x| ≤ 6` 从地面区间中**扣除**后另铺河床 + 水面，陆地与水体水平不重叠；
-> 河岸窄条在带两侧，与地面 y 差 0.15。全部层为纯装饰，
-> **服务端裁决平面恒为 y=0**，英雄可涉水、不被高地阻挡。
-> 地面 144 块改用共享 `Cuboid` + `with_scale`，不再逐块 `meshes.add`。
+> 地图为 **480×240 横向长方形**（`MAP_SCALE = 1.5` 等比放大）；地面按
+> `GROUND_TILES_X=32` / `GROUND_TILES_Z=16` 分轴拼贴，每格
+> `MAP_WIDTH / 32 = 15` 单位（块边长随地图缩放自动跟随），
+> 正好铺满两轴且「块宽 == 中心距」不产生水平重叠。
+> 河道沿中轴 `x = 0` **纵向**贯穿，与北侧水平兵线走向正交；
+> 判据为 `river_cross(pos) = |x| ≤ 12` 且 `river_axis(pos) = z ≥ -120`；
+> 桥面为 `|z − BRIDGE_Z| ≤ 15`（`BRIDGE_Z = -60`）。
+> 拼贴按**整块归类**：河块铺下沉河床 + 水面，桥块铺石台，陆块铺草 / 土，
+> 每块只生成一种，水平不重叠，因此不会 z-fighting；河岸为 `x = ±12.6` 的两条纵向窄石带。
+> 另有正下方中央的共用野区商店广场（石台 + 柜台 + 四角立柱），盖在河道南端之上。
+>
+> **兵线 / 野区分隔墙不属于地表层**，而是独立的 3D 实体：按 `LANE_WALLS` 的
+> **南侧 4 段**（兵线北侧靠地图边界，P-U6 起不设墙）各生成一块石质墙体
+> （高 2.6、厚 `2 * WALL_HALF_THICKNESS = 4.8`）、一块位于主体顶面之上的压顶石，
+> 以及段端两根较高门柱标出坡道入口。5 处 `LANE_WALL_GAPS` 不生成墙体，
+> 视觉断口与服务端碰撞 / A* 障碍完全一致。
+> 地表层（含墙）均为纯装饰，**服务端裁决平面恒为 y=0**，英雄可涉水、不被高地阻挡；
+> 墙的阻挡能力来自 `server/spawn.rs::spawn_lane_walls` 的静态碰撞体，不来自渲染网格。
+> 地面块改用共享 `Cuboid` + `with_scale`，不再逐块 `meshes.add`。
 
 #### 12.2.3 8-bit 音频
 
@@ -653,7 +698,26 @@ P-V0 不改动运行时行为，只把「视觉方向、美术风格、色彩规
 | 8 | 各类光标 / 选中 / 落点标记 y 散落 0.06 / 0.15 / 0.2，与地形层近共面 | 统一 `MARKER_Y`，与层表联动 |
 
 > 护栏单测：`terrain_layers_are_ordered_and_separated`、`ground_tiles_do_not_overlap`、
-> `water_palette_is_enabled`、`marker_y_clears_highest_terrain_layer`。
+> `water_palette_is_enabled`、`marker_y_clears_highest_terrain_layer`、
+> `lane_walls_are_rendered_from_the_authoritative_segments`。
+
+#### 12.4.1 普攻可读性（P-U6）
+
+旧实现里挥击 / 刀光 / 弹道**全部**由服务端 `DamageDealt` 事件驱动，而 `attack_system`
+只在「射程内有目标并造成伤害」时才产生该事件：右键锁定后目标还差几步、或挥空时
+没有任何攻击动作；命中了也要等一整个 RTT 才播。此外 `CombatFxRequest.damage`
+被 `let _ = req.damage;` 丢弃，没有伤害数字。
+
+| 层 | 表现 |
+|---|---|
+| 本地即时起手 | `rendering::local_attack_anticipation` 读 `PlayerInputState`，按英雄攻速插 `AttackAnim`（肩枢轴抬手 → 挥出 → 收势）并朝锁定目标 / 鼠标落点甩出一道 0.16 s 的短刀光；挥空也播 |
+| 服务端命中 | `spawn_combat_fx` 保留完整近战刀光 + 延迟命中火花 / 远程弹道，并刷新挥击计时；与本地起手互为补充，不会叠加动画 |
+| 伤害数字 | `FloatingTexts` 世界空间飘字，以 `NetId` 为锚点（跟随目标），由 egui HUD 层用主相机 `world_to_viewport` 投影绘制，0.9 s 内上浮淡出；暴击加 `!` 并换橙色，同屏上限 40 条 |
+| 环境伤害 | `CombatFxRequest.attacker: Option<NetId>` 为 `None` 时只播目标端火花 + 冷蓝色数字，**不触发挥击 / 刀光 / 弹道** |
+| 涉水警示 | `draw_hazard_warning` 用与服务端同源的 `is_hazardous_river` 判定，危险水域里显示「河水灼烧 −50 HP/s · 请走桥面过河」 |
+
+> 护栏单测：`damage_labels_are_readable`、`floating_texts_are_anchored_and_budgeted`、
+> `environment_damage_has_no_attacker`、`rendering_plugin_schedule_builds_without_query_conflict`。
 
 #### 12.4.2 技能不落在鼠标点击处
 
@@ -663,7 +727,7 @@ P-V0 不改动运行时行为，只把「视觉方向、美术风格、色彩规
 | 2 | 旧 `camera_pair` 从两个独立 Query 各取第一个，不保证配对 | 同上，合并查询 |
 | 3 | 左键确认使用**上一帧**缓存 `target_point`（瞄准计算在左键之后执行），慢一帧；缓存 `None` 时上报零向量 | 确认当帧用主相机重新求交；无命中**不产生 `PendingCast`**、保持瞄准态 |
 | 4 | `viewport_to_world` 命中点 y 残留，下游把 `Vec3` 当下行坐标 | `ground_hit` 显式 `Vec3::new(hit.x, 0.0, hit.z)` |
-| 5 | 服务端不校验 `aim_dir`，把 `(0,0)` / NaN / 越界当合法落点 | 新增 `is_finite` + 非零 + `|x|,|z| ≤ MAP_HALF` 三重校验；非法目标落点留在施法者脚下 |
+| 5 | 服务端不校验 `aim_dir`，把 `(0,0)` / NaN / 越界当合法落点 | 新增 `is_finite` + 非零 + `|x| ≤ MAP_W_HALF`、`|z| ≤ MAP_H_HALF` 分轴校验；非法目标落点留在施法者脚下 |
 | 6 | 服务端用 3D `length()` 算水平距离，被施法者 y 分量污染 | 改用 `Vec2` 水平距离，方向向量 y 恒 0 |
 | 7 | `PendingInputs` 从不清空技能位，同一 `InputCmd` 每 tick 重复触发施法 | 消费后 `ability_mask &= 1`（保留普攻位） |
 | 8 | 客户端技能起点锚在落点后方 `range*0.4`，视觉上像「从别处飞来」 | 起点改为落点正上方 `to + Y*2.0`，保持五阶段垂直下落 |

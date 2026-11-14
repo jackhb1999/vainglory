@@ -130,6 +130,16 @@ pub fn drain_gameplay_events(
                 killer: NetId(0),
                 team: Team::Neutral,
             },
+            NetEvent::AbyssWardenSpawn { position } => GameEvent::AbyssWardenSpawn { position },
+            NetEvent::AbyssWardenDeath { killer_team } => {
+                GameEvent::AbyssWardenDeath { killer_team }
+            }
+            NetEvent::LodeShrineCapture { team } => GameEvent::LodeShrineCapture { team },
+            NetEvent::ObjectiveIncome { owner, amount } => GameEvent::ObjectiveIncome {
+                owner,
+                amount,
+                event_id: id,
+            },
         };
         out.0.push(game_event);
     }

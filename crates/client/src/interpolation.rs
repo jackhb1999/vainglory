@@ -37,6 +37,7 @@ impl Plugin for InterpolationPlugin {
                     store_snapshot_history,
                     interpolate_entities,
                     sync_hero_stats,
+                    sync_world_health_bars,
                     crate::entity_visual::tick_non_hero_anim,
                 )
                     .chain(),
@@ -210,6 +211,11 @@ fn sync_minions(
                 radius: 0.8,
                 height: 2.0,
             },
+            crate::rendering::WorldHealthBar {
+                health: es.health,
+                max_health: es.max_health,
+                y_offset: 2.8,
+            },
         ));
     }
 
@@ -234,6 +240,30 @@ fn sync_minions(
             if should_start_dying(&seen, *nid, &dying) {
                 dying.0.insert(*nid, DYING_TIME);
             }
+        }
+    }
+}
+
+/// 用权威快照刷新所有非英雄实体的 `WorldHealthBar`（野怪 / 小兵 / 哨塔）。
+/// 英雄血量由 `sync_hero_stats` 写入 `Hero`；这里只处理带 NetId 的世界实体。
+fn sync_world_health_bars(
+    snapshot: Option<Res<ReceivedSnapshot>>,
+    mut bars: Query<(&NetId, &mut crate::rendering::WorldHealthBar)>,
+) {
+    let Some(snapshot) = snapshot else { return };
+    if snapshot.0.tick == 0 {
+        return;
+    }
+    let hp: HashMap<u64, (f32, f32)> = snapshot
+        .0
+        .entities
+        .iter()
+        .map(|e| (e.net_id.0, (e.health, e.max_health)))
+        .collect();
+    for (nid, mut bar) in bars.iter_mut() {
+        if let Some(&(health, max_health)) = hp.get(&nid.0) {
+            bar.health = health;
+            bar.max_health = max_health;
         }
     }
 }

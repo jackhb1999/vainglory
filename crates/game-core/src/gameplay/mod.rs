@@ -8,6 +8,8 @@ pub mod clock;
 pub mod combat;
 pub mod jungle;
 pub mod objectives;
+/// 中立目标的经济 / 刷新裁决（§13.2 辉矿、§13.4 渊卫）。
+pub mod objectives_economy;
 pub mod registry;
 pub mod respawn;
 pub mod shop;
@@ -88,6 +90,22 @@ pub enum NetEvent {
     /// 野怪死亡：同上，并触发客户端特效。
     JungleMonsterDeath {
         net_id: u64,
+    },
+    /// 渊卫（中央矿坑全局首领）刷新 / 被击败：全局广播，客户端在坑位播放特效与提示。
+    AbyssWardenSpawn {
+        position: crate::net::Vec3f,
+    },
+    AbyssWardenDeath {
+        killer_team: Team,
+    },
+    /// 兵矿（辉矿）被占领：客户端在小地图标记归属。
+    LodeShrineCapture {
+        team: Team,
+    },
+    /// 兵矿归属期间的周期收益，供 HUD 飘字；金币本身由 `CH_GOLD` 快照裁决。
+    ObjectiveIncome {
+        owner: Team,
+        amount: u32,
     },
 }
 

@@ -13,7 +13,7 @@ use game_core::gameplay::{
 };
 use game_core::map::{BLUE_SOURCE_CORE, RED_SOURCE_CORE};
 use game_core::net::JungleMonsterType;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 商品表资源：局内不可变，热更只影响新对局（`FR-61`）。
 #[derive(Resource)]
@@ -168,22 +168,29 @@ pub fn attach_world_gameplay(
     }
     if !ready.0 {
         ready.0 = true;
-        // 征募井 / 辉矿（§13.2 / §13.3）：直接取自野区营地表中的两座野区商店，
-        // 保证占点位置与地图（单条兵线 + 内侧野区）完全同源。
-        let shops: Vec<Vec3> = game_core::map::JUNGLE_CAMPS
-            .iter()
-            .filter(|c| {
-                matches!(
-                    c.monster_type,
-                    JungleMonsterType::MusterWell | JungleMonsterType::LodeShrine
-                )
-            })
-            .map(|c| c.position)
-            .collect();
-        for (idx, pos) in shops.into_iter().enumerate() {
+        // 征募井 / 辉矿（§13.2 / §13.3）：位置直接取自野区营地表，与地图同源。
+        //
+        // id 必须**按类型**分配，不能用枚举下标：旧版 JUNGLE_CAMPS 顺序给出的
+        // idx+1 是 [辉矿(1), 辉矿(2), 征募井(3)]，而 `attributes::objective_buff` /
+        // `registry::objective_name` 的 1/2/3 是 [辉矿, 征募井, 渊卫] ——
+        // 第二座兵矿发成了征募井 buff、征募井发成了渊卫 buff。两座兵矿共用 id 1
+        // （同类型同 buff），征募井 id 2，id 3 留给渊卫（不走 CapturePoint）。
+        use game_core::gameplay::objectives_economy::{
+            OBJECTIVE_LODE_SHRINE, OBJECTIVE_MUSTER_WELL,
+        };
+        for camp in game_core::map::JUNGLE_CAMPS.iter().filter(|c| {
+            matches!(
+                c.monster_type,
+                JungleMonsterType::MusterWell | JungleMonsterType::LodeShrine
+            )
+        }) {
+            let id = match camp.monster_type {
+                JungleMonsterType::LodeShrine => OBJECTIVE_LODE_SHRINE,
+                _ => OBJECTIVE_MUSTER_WELL,
+            };
             commands.spawn((
-                Transform::from_translation(pos),
-                objectives::CapturePoint::new(idx as u32 + 1, 100, 5400),
+                Transform::from_translation(camp.position),
+                objectives::CapturePoint::new(id, 100, 5400),
             ));
         }
     }
@@ -219,6 +226,11 @@ pub fn regen_system(
 }
 
 /// 死亡与重生（§15）：消费击杀流水、结算连杀赏金、恢复生命并给出生保护。
+///
+/// 死亡判定以**权威血量**为准（不只看击杀流水）：技能 / 野怪 / 哨塔等伤害路径同样
+/// 会把 health 打到 0，这里统一登记死亡，避免出现「血空但没进死亡状态、永远不重生」。
+/// 死亡瞬间立即把实体吸附到泉水并写回 `TransformSync`，客户端据此隐藏可视体、冻结输入；
+/// 重生时同步写回 `TransformSync`，否则快照永远停在死亡位置（表现为「等一会才在泉水复活」）。
 #[allow(clippy::type_complexity)]
 pub fn death_respawn_system(
     tick: Res<ServerTick>,
@@ -232,38 +244,76 @@ pub fn death_respawn_system(
         &mut combat::ShieldPool,
         &mut respawn::KillStreak,
         &mut Transform,
+        Option<&mut TransformSync>,
     )>,
     id_to_entity: Query<(Entity, &NetId)>,
 ) {
     let index: HashMap<u64, Entity> = id_to_entity.iter().map(|(e, n)| (n.0, e)).collect();
+    // 一次死亡只广播一次 HeroDeath，避免客户端反复刷新倒地动画 / 重复播放金币特效。
+    let mut reported: HashSet<u64> = HashSet::new();
+    // 击杀流水携带的权威死亡 tick 决定复活时刻；不能用当前帧 tick，否则会晚一帧。
+    let mut death_ticks: HashMap<u64, u64> = HashMap::new();
 
     for (t, killer_id, victim_id) in pending.0.drain(..) {
+        death_ticks.insert(victim_id, t);
         let mut bounty = 0;
         if let Some(&ke) = index.get(&killer_id)
-            && let Ok((_, mut hero, _, _, _, mut streak, _)) = query.get_mut(ke)
+            && let Ok((_, mut hero, _, _, _, mut streak, _, _)) = query.get_mut(ke)
         {
             bounty = respawn::kill_bounty(&mut streak, t);
             respawn::register_kill(&mut streak, t);
             hero.gold = hero.gold.saturating_add(bounty);
         }
-        if let Some(&ve) = index.get(&victim_id)
-            && let Ok((_, _, mut state, mut status, mut shield, mut streak, _)) = query.get_mut(ve)
-            && !state.dead
-        {
-            respawn::mark_dead(&mut state, t);
+        if reported.insert(victim_id) {
+            events.deaths.push(respawn::DeathRecord {
+                victim_net_id: victim_id,
+                killer_net_id: killer_id,
+                tick: t,
+                bounty,
+            });
+        }
+    }
+
+    for (
+        net_id,
+        mut hero,
+        mut state,
+        mut status,
+        mut shield,
+        mut streak,
+        mut transform,
+        mut sync,
+    ) in query.iter_mut()
+    {
+        // 血量归零但尚未登记死亡：补齐死亡状态（覆盖非普攻致死路径）。
+        if hero.health <= combat::EPS && !state.dead {
+            let death_tick = death_ticks.get(&net_id.0).copied().unwrap_or(tick.0);
+            state.level = hero.level;
+            respawn::mark_dead(&mut state, death_tick);
             respawn::reset_streak(&mut streak);
             status.clear();
             shield.value = 0.0;
+            if reported.insert(net_id.0) {
+                events.deaths.push(respawn::DeathRecord {
+                    victim_net_id: net_id.0,
+                    killer_net_id: 0,
+                    tick: death_tick,
+                    bounty: 0,
+                });
+            }
         }
-        events.deaths.push(respawn::DeathRecord {
-            victim_net_id: victim_id,
-            killer_net_id: killer_id,
-            tick: t,
-            bounty,
-        });
-    }
 
-    for (_, mut hero, mut state, mut status, mut shield, _, mut transform) in query.iter_mut() {
+        if state.dead {
+            // 尸体立即回到泉水（隐藏的可视体不再留在战场 / 不再被索敌与碰撞）。
+            transform.translation.x = state.spawn_point.x;
+            transform.translation.z = state.spawn_point.y;
+            if let Some(s) = sync.as_deref_mut() {
+                s.position = transform.translation;
+                s.velocity = Vec3::ZERO;
+            }
+            hero.health = 0.0;
+        }
+
         if respawn::step_respawn(&mut state, tick.0) {
             hero.health = hero.max_health;
             hero.energy = hero.max_energy;
@@ -281,6 +331,10 @@ pub fn death_respawn_system(
             );
             transform.translation.x = state.spawn_point.x;
             transform.translation.z = state.spawn_point.y;
+            if let Some(s) = sync.as_deref_mut() {
+                s.position = transform.translation;
+                s.velocity = Vec3::ZERO;
+            }
         }
     }
 }
@@ -288,9 +342,14 @@ pub fn death_respawn_system(
 /// 野怪 AI（§12.3）：从只读快照取最近敌方英雄，推进状态机并写回位移。
 pub fn monster_ai_system(
     snapshot: Res<WorldSnapshot>,
-    mut monsters: Query<(&mut jungle::MonsterAi, &mut Transform, Option<&Team>)>,
+    mut monsters: Query<(
+        &mut jungle::MonsterAi,
+        &mut Transform,
+        Option<&mut TransformSync>,
+        Option<&Team>,
+    )>,
 ) {
-    for (mut ai, mut transform, team) in monsters.iter_mut() {
+    for (mut ai, mut transform, mut sync, team) in monsters.iter_mut() {
         let pos = Vec2::new(transform.translation.x, transform.translation.z);
         let own_team = team.copied().unwrap_or(Team::Neutral);
         let nearest = snapshot
@@ -312,6 +371,10 @@ pub fn monster_ai_system(
         );
         transform.translation.x += out.desired_move_dir.x / 60.0;
         transform.translation.z += out.desired_move_dir.y / 60.0;
+        if let Some(s) = sync.as_deref_mut() {
+            s.position = transform.translation;
+            s.velocity = Vec3::new(out.desired_move_dir.x, 0.0, out.desired_move_dir.y);
+        }
     }
 }
 

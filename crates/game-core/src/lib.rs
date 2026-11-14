@@ -7,6 +7,9 @@ pub mod components;
 pub mod gameplay;
 pub mod map;
 pub mod math;
+/// `NAV-M2-01` 双端同源动态障碍网格。
+pub mod navgrid;
+pub mod navigation;
 pub mod net;
 pub mod systems;
 pub mod visibility;

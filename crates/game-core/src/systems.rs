@@ -125,49 +125,112 @@ impl SimTime {
     }
 }
 
-/// 移动系统
+/// 记录一次移动违规（§24.3 `NAV-M2-03-C6`）：连续 3 次写 warn，本阶段只审计不踢人。
+fn record_movement_violation(
+    violations: &mut crate::navigation::MovementViolations,
+    entity: Entity,
+    tick: u64,
+    reason: Option<crate::navigation::RejectReason>,
+) {
+    let count = violations.record(entity, tick);
+    if count >= crate::navigation::VIOLATION_WARN_THRESHOLD {
+        warn!(
+            "[NAV] repeated movement violations: entity={entity:?} count={count} reason={reason:?}"
+        );
+    }
+}
+
+/// 移动系统（`NAV-M2-03` 已落地：位置积分后立即做权威合法性校验）。
+#[allow(clippy::type_complexity)]
 pub fn movement_system(
     time: Res<SimTime>,
     mut query: Query<
-        (&mut Transform, &mut TransformSync, &Hero, &PlayerInput),
+        (
+            Entity,
+            &mut Transform,
+            &mut TransformSync,
+            &Hero,
+            &PlayerInput,
+        ),
         Without<Interpolated>,
     >,
+    mut violations: Option<ResMut<crate::navigation::MovementViolations>>,
+    grid: Option<Res<crate::navgrid::NavGrid>>,
 ) {
     let dt = time.delta_secs().min(FIXED_TIMESTEP * 3.0);
 
-    for (mut transform, mut sync, hero, input) in query.iter_mut() {
+    for (entity, mut transform, mut sync, hero, input) in query.iter_mut() {
+        // 死亡门禁：血量为 0 的英雄不得移动（等待重生）。否则尸体仍会被旧输入推着走。
+        if hero.health <= combat::EPS {
+            sync.velocity = Vec3::ZERO;
+            continue;
+        }
         if input.move_dir != Vec2::ZERO {
             let direction = Vec3::new(input.move_dir.x, 0.0, input.move_dir.y).normalize();
-            // 河道（|x| ≤ RIVER_HALF_WIDTH）减速为一半；仅影响速度，不改裁决平面。
+            // 纵向河道（沿 x = 0，兵线跨河的桥面全速）减速为一半；仅影响速度，不改裁决平面。
             let speed = hero.move_speed * crate::map::terrain_speed_mult(transform.translation);
             let velocity = direction * speed;
 
+            let prev = Vec2::new(transform.translation.x, transform.translation.z);
             transform.translation += velocity * dt;
             // 限制英雄在地图边界内，避免跑出地图
             let half_w = MAP_WIDTH / 2.0 - 1.0;
             let half_h = MAP_HEIGHT / 2.0 - 1.0;
             transform.translation.x = transform.translation.x.clamp(-half_w, half_w);
             transform.translation.z = transform.translation.z.clamp(-half_h, half_h);
-            sync.position = transform.translation;
-            sync.velocity = velocity;
+            let proposed = Vec2::new(transform.translation.x, transform.translation.z);
+
+            // §3.3「服务端负责合法性」：拒绝加速 / 穿墙 / 瞬移 / 非有限位置，
+            // 回退到上一 tick 的安全位置，由下一次权威快照让客户端回滚预测。
+            // `move_speed` 取服务端 `Hero` 值，不信任客户端上报的任何速度字段。
+            let result = match grid.as_deref() {
+                Some(g) => crate::navigation::validate_movement_with_grid(
+                    prev,
+                    proposed,
+                    hero.move_speed,
+                    dt,
+                    g,
+                ),
+                None => crate::navigation::validate_movement(prev, proposed, hero.move_speed, dt),
+            };
+            if !result.accepted {
+                transform.translation.x = result.corrected_position.x;
+                transform.translation.z = result.corrected_position.y;
+                sync.position = transform.translation;
+                sync.velocity = Vec3::ZERO;
+                if let Some(v) = violations.as_deref_mut() {
+                    record_movement_violation(v, entity, time.tick(), result.reject_reason);
+                }
+            } else {
+                sync.position = transform.translation;
+                sync.velocity = velocity;
+            }
         } else {
             sync.velocity = Vec3::ZERO;
         }
     }
 }
 
-/// 简单的朝向系统
+/// 简单的朝向系统。
+///
+/// 朝向必须**同时**写回 `TransformSync.rotation`：快照下发的是 `TransformSync`，
+/// 只写 `Transform` 会让服务端快照永远是单位四元数，客户端回滚时把本地朝向
+/// 反复 slerp 回正，表现为「走路时人物随机乱晃」。
 #[allow(clippy::type_complexity)]
 pub fn facing_system(
-    mut query: Query<(&mut Transform, &PlayerInput), (With<Hero>, Without<Interpolated>)>,
+    mut query: Query<
+        (&mut Transform, &mut TransformSync, &PlayerInput),
+        (With<Hero>, Without<Interpolated>),
+    >,
 ) {
-    for (mut transform, input) in query.iter_mut() {
+    for (mut transform, mut sync, input) in query.iter_mut() {
         if input.aim_dir != Vec2::ZERO {
             // aim_dir 是地面世界坐标点：朝向 = 该点 - 自身位置
             let dir = input.aim_dir - Vec2::new(transform.translation.x, transform.translation.z);
             if dir.length_squared() > 1e-6 {
                 let angle = dir.y.atan2(dir.x);
                 transform.rotation = Quat::from_rotation_y(-angle);
+                sync.rotation = transform.rotation;
             }
         }
     }
@@ -250,6 +313,10 @@ pub fn attack_system(
     let current_tick = time.tick();
 
     for (entity, mut hero, transform, input, own_team) in query.iter_mut() {
+        // 死亡门禁：阵亡英雄不得发起普攻，避免尸体持续产出 AttackCommand / 重复击杀流水。
+        if hero.health <= combat::EPS {
+            continue;
+        }
         if hero.attack_cooldown > 0.0 {
             hero.attack_cooldown = (hero.attack_cooldown - FIXED_TIMESTEP).max(0.0);
         }
@@ -348,6 +415,15 @@ pub fn damage_system(
             respawn_state,
         )) = targets.get_mut(cmd.target)
         {
+            // 记录扣血前是否仍存活：尸体（health<=0）被继续命中时不得再产出击杀流水，
+            // 否则死亡期间会重复广播 HeroDeath（客户端反复刷新倒地动画）。
+            let was_alive = target_hero.health > combat::EPS;
+            // 尸体不再承受伤害：避免死亡期间持续刷伤害数字 / 触发重复击杀流水。
+            // 仍要移除本次 AttackCommand，否则下一 tick 会对尸体重复结算。
+            if !was_alive {
+                commands.entity(attacker).remove::<AttackCommand>();
+                continue;
+            }
             let dealt = match shield.as_deref_mut() {
                 Some(pool) => {
                     let stats = target_stats.copied().unwrap_or_default();
@@ -381,7 +457,7 @@ pub fn damage_system(
                     .push((cmd.attacker, cmd.target, dealt, cmd.damage_type));
             }
 
-            let lethal = target_hero.health <= combat::EPS && dummy.is_none();
+            let lethal = was_alive && target_hero.health <= combat::EPS && dummy.is_none();
             let has_respawn = respawn_state.is_some();
             let victim_id = target_net_id.map(|n| n.0).unwrap_or(0);
             if lethal {
@@ -432,13 +508,21 @@ pub fn level_up_system(
     }
 }
 
-/// 经济系统：被动金币
-pub fn passive_gold_system(time: Res<SimTime>, mut query: Query<&mut Hero>) {
-    let gold_per_second = 1.3; // 基础被动金币
-    let dt = time.delta_secs();
-
+/// 经济系统：被动金币（权威，60Hz 固定步长）。
+///
+/// 旧实现 `hero.gold += (1.3 * 1/60) as u32` 每 tick 都加 **0**：`u32` 截断把
+/// 小数全部丢掉，且没有累加器 —— 被动收入实际完全空转。现在用 `Local<f32>` 保存
+/// 小数余量，攒够 1 金才统一发放，既不丢精度也保持整数金币与快照 delta 兼容。
+/// 所有英雄收入相同，因此一个全局累加器即可，不必给每个 `Hero` 加字段。
+pub fn passive_gold_system(time: Res<SimTime>, mut carry: Local<f32>, mut query: Query<&mut Hero>) {
+    *carry += PASSIVE_GOLD_PER_SECOND * time.delta_secs();
+    let whole = *carry as u32;
+    if whole == 0 {
+        return;
+    }
+    *carry -= whole as f32;
     for mut hero in query.iter_mut() {
-        hero.gold += (gold_per_second * dt) as u32;
+        hero.gold = hero.gold.saturating_add(whole);
     }
 }
 
@@ -524,5 +608,63 @@ pub fn energy_regen_system(time: Res<SimTime>, mut query: Query<&mut Hero>) {
         if hero.energy < hero.max_energy {
             hero.energy = (hero.energy + hero.max_energy * 0.02 * dt).min(hero.max_energy);
         }
+    }
+}
+
+#[cfg(test)]
+mod economy_tests {
+    use super::*;
+
+    /// 回归护栏：60Hz 下每 tick 不足 1 金，**必须**用累加器攒够再发，不能每 tick 截断成 0。
+    #[test]
+    fn passive_gold_accrues_every_twenty_ticks() {
+        let mut world = World::new();
+        world.insert_resource(SimTime(0));
+        let hero_a = world.spawn(Hero::default()).id();
+        let hero_b = world.spawn(Hero::default()).id();
+        let id = world.register_system(passive_gold_system);
+
+        for _ in 0..19 {
+            world.run_system(id).unwrap();
+        }
+        assert_eq!(
+            world.entity(hero_a).get::<Hero>().unwrap().gold,
+            STARTING_GOLD,
+            "不足 1 金时不应发放"
+        );
+        world.run_system(id).unwrap();
+        assert_eq!(
+            world.entity(hero_a).get::<Hero>().unwrap().gold,
+            STARTING_GOLD + 1
+        );
+        assert_eq!(
+            world.entity(hero_b).get::<Hero>().unwrap().gold,
+            STARTING_GOLD + 1,
+            "所有英雄收入对等"
+        );
+        for _ in 0..20 {
+            world.run_system(id).unwrap();
+        }
+        assert_eq!(
+            world.entity(hero_a).get::<Hero>().unwrap().gold,
+            STARTING_GOLD + 2,
+            "第 40 tick 恰好再发 1 金，不会因浮点误差漂移"
+        );
+    }
+
+    #[test]
+    fn every_hero_starts_with_purchasable_gold() {
+        let hero = Hero::default();
+        assert_eq!(hero.gold, STARTING_GOLD);
+        let catalog = crate::gameplay::shop::ShopCatalog::placeholder();
+        let cheapest = catalog.items.iter().map(|i| i.price).min().unwrap();
+        assert!(
+            hero.gold >= cheapest,
+            "开局金币必须买得起最便宜的一件起始装"
+        );
+        assert!(
+            (PASSIVE_GOLD_PER_SECOND - 0.05 * 60.0).abs() < 1e-4,
+            "与配置层每 tick 0.05 等价"
+        );
     }
 }

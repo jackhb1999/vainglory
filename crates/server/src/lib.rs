@@ -3,6 +3,7 @@
 pub mod gameplay;
 pub mod net_bridge;
 pub mod networking;
+pub mod objectives;
 pub mod simulation;
 pub mod spawn;
 pub mod systems;

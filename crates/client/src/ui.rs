@@ -1,10 +1,12 @@
 //! 客户端 UI 系统（egui）
 //!
 //! 包含：左上角 HUD（血/蓝/等级/金币）、底部 QWER + 召唤师技能栏、
-//! 右上角小地图（绘制折叠线/单条兵线/塔/基地/金矿/实体）、商店占位窗口、输入调试面板。
+//! 右上角小地图（横向长方形 / 纵向河道 / 单条水平兵线 / 塔 / 基地 / 矿坑 / 商店 / 实体）、商店占位窗口、输入调试面板。
 
 use bevy::prelude::*;
-use bevy_egui::{EguiContexts, EguiGlobalSettings, EguiPrimaryContextPass, egui};
+use bevy_egui::{
+    EguiContexts, EguiGlobalSettings, EguiPrimaryContextPass, PrimaryEguiContext, egui,
+};
 
 use crate::AppState;
 use crate::input::{PlayerInputState, SelectedTarget};
@@ -52,6 +54,10 @@ impl Plugin for UiPlugin {
                     draw_ability_bar.run_if(in_state(AppState::InMatch)),
                     crate::lobby_ui::draw_shop.run_if(in_state(AppState::InMatch)),
                     draw_debug_panel.run_if(in_state(AppState::InMatch)),
+                    draw_death_overlay.run_if(in_state(AppState::InMatch)),
+                    // 世界空间飘字与涉水警示：放在最后，保证盖在所有 HUD 之上。
+                    draw_floating_texts.run_if(in_state(AppState::InMatch)),
+                    draw_hazard_warning.run_if(in_state(AppState::InMatch)),
                 )
                     .chain(),
             );
@@ -146,41 +152,87 @@ fn draw_lobby(
             // 取出 painter 的克隆，避免与下方 `ui.put`（需要 &mut ui）的借用冲突
             let p = ui.painter().clone();
 
-            // 深色底 + 3v3 竞技场示意：单条 L 形兵线 + 野区折叠线
+            // 深色底 + 经典单路 3v3 示意：**横向长方形**，兵线在北侧横贯左右，
+            // 野区在兵线南侧，纵向河道把野区切成左右两半，正下方中央是共用商店。
             p.rect_filled(screen, 0.0, egui::Color32::from_rgb(8, 10, 18));
-            let lane_stroke = egui::Stroke::new(3.0, egui::Color32::from_rgb(26, 38, 60));
-            // 单条兵线：左下 → 左侧边线 → 顶部边线 → 右上（与游戏内路点同构）
-            let lane_pts = vec![
-                egui::pos2(screen.left() + w * 0.10, screen.top() + h * 0.90),
-                egui::pos2(screen.left() + w * 0.10, screen.top() + h * 0.18),
-                egui::pos2(screen.right() - w * 0.10, screen.top() + h * 0.18),
-                egui::pos2(screen.right() - w * 0.08, screen.top() + h * 0.08),
+            let mx = screen.left() + w * 0.10;
+            let mw = w * 0.80;
+            let my = screen.top() + h * 0.20;
+            let mh = h * 0.62;
+            // 地图边框：2:1 长方形（与 game_core::map 同源）
+            let border = egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 50, 70));
+            let corners = [
+                egui::pos2(mx, my),
+                egui::pos2(mx + mw, my),
+                egui::pos2(mx + mw, my + mh),
+                egui::pos2(mx, my + mh),
             ];
-            p.add(egui::Shape::line(lane_pts, lane_stroke));
-            // 野区折叠线（左上 → 右下的镜像对称轴）
+            for i in 0..4 {
+                p.line_segment([corners[i], corners[(i + 1) % 4]], border);
+            }
+            // 单条水平兵线：北侧，从左端蓝方基地到右端红方基地
+            let lane_y = my + mh * 0.25;
             p.line_segment(
                 [
-                    egui::pos2(screen.left() + w * 0.2, screen.top() + h * 0.22),
-                    egui::pos2(screen.right() - w * 0.2, screen.bottom() - h * 0.08),
+                    egui::pos2(mx + mw * 0.06, lane_y),
+                    egui::pos2(mx + mw * 0.94, lane_y),
                 ],
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(18, 42, 78)),
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(26, 38, 60)),
             );
-            // 双方基地示意
+            // 兵线 / 野区分隔墙：只在兵线南侧（靠野区一侧），断开处即坡道开口。
+            // 用与 `to_minimap` 同构的分轴归一化，保证示意位置与真实地图一致。
+            let sx = |x: f32| mx + ((x / MAP_W_HALF) * 0.5 + 0.5) * mw;
+            let sz = |z: f32| my + ((z / MAP_H_HALF) * 0.5 + 0.5) * mh;
+            let wall_stroke = egui::Stroke::new(2.5, egui::Color32::from_rgb(150, 145, 132));
+            for w in LANE_WALLS {
+                p.line_segment(
+                    [egui::pos2(sx(w.x0), sz(w.z)), egui::pos2(sx(w.x1), sz(w.z))],
+                    wall_stroke,
+                );
+            }
+            // 纵向河道：沿中轴，与兵线正交，交点即桥面
+            let cx = mx + mw * 0.5;
+            p.line_segment(
+                [
+                    egui::pos2(cx, my + mh * 0.02),
+                    egui::pos2(cx, my + mh * 0.82),
+                ],
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(30, 90, 140)),
+            );
+            p.line_segment(
+                [egui::pos2(cx - 7.0, lane_y), egui::pos2(cx + 7.0, lane_y)],
+                egui::Stroke::new(4.0, egui::Color32::from_rgb(170, 160, 130)),
+            );
+            // 双方基地：兵线左右两端
             p.circle_filled(
-                egui::pos2(screen.left() + w * 0.12, screen.top() + h * 0.86),
-                w.min(h) * 0.035,
+                egui::pos2(mx + mw * 0.06, lane_y),
+                mh * 0.075,
                 egui::Color32::from_rgb(46, 96, 214),
             );
             p.circle_filled(
-                egui::pos2(screen.left() + w * 0.88, screen.top() + h * 0.14),
-                w.min(h) * 0.035,
+                egui::pos2(mx + mw * 0.94, lane_y),
+                mh * 0.075,
                 egui::Color32::from_rgb(200, 56, 52),
             );
-            // 地图中心金矿 / 海妖坑
-            p.circle_stroke(
-                egui::pos2(screen.center().x, screen.top() + h * 0.62),
-                w.min(h) * 0.03,
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(226, 184, 62)),
+            // 左下 / 右下角：两座兵矿
+            for fx in [0.18_f32, 0.82] {
+                p.circle_filled(
+                    egui::pos2(mx + mw * fx, my + mh * 0.80),
+                    mh * 0.035,
+                    egui::Color32::from_rgb(70, 200, 210),
+                );
+            }
+            // 正下方中央：双方共用的野区商店
+            p.circle_filled(
+                egui::pos2(cx, my + mh * 0.88),
+                mh * 0.045,
+                egui::Color32::from_rgb(148, 96, 214),
+            );
+            // 兵线中点正下方、河道之上：中央矿坑
+            p.circle_filled(
+                egui::pos2(cx, my + mh * 0.55),
+                mh * 0.040,
+                egui::Color32::from_rgb(226, 184, 62),
             );
 
             let title_pos = egui::pos2(screen.center().x, screen.top() + h * 0.14);
@@ -333,9 +385,9 @@ fn draw_lobby(
                 egui::pos2(screen.center().x, screen.top() + h * 0.845),
                 egui::Align2::CENTER_CENTER,
                 if zh {
-                    "左键点击地面移动 · WASD/方向键也移动 · 右键锁定攻击 · Q/E/R/F 技能 · P 商店"
+                    "左键点击地面移动 · 右键立即移动/锁定攻击 · Q/E/R/F 技能 · P 商店"
                 } else {
-                    "LMB click: move - WASD: move - RMB: lock - Q/E/R/F skills - P shop"
+                    "LMB click: move - RMB: force move/lock - Q/E/R/F skills - P shop"
                 },
                 egui::FontId::proportional(14.0),
                 egui::Color32::from_rgb(130, 145, 170),
@@ -357,6 +409,36 @@ fn draw_lobby(
 /// 字体探测候选是否覆盖了三个主流平台（供门禁与自检使用）。
 #[cfg(test)]
 pub const CJK_FONT_PLATFORMS: usize = 3;
+
+/// 阵亡遮罩 + 复活倒计时：让「血空之后去哪了、多久回来」有明确反馈。
+fn draw_death_overlay(mut contexts: EguiContexts, input: Res<PlayerInputState>) {
+    if !input.dead {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    egui::Area::new(egui::Id::new("death_overlay"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(egui::Color32::from_rgba_unmultiplied(12, 8, 14, 210))
+                .corner_radius(6.0)
+                .inner_margin(18.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("已阵亡")
+                            .size(26.0)
+                            .color(egui::Color32::from_rgb(235, 90, 90)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "泉水复活倒计时  {:.1} s",
+                            input.respawn_remaining
+                        ))
+                        .size(17.0),
+                    );
+                });
+        });
+}
 
 /// 团队颜色（用于 HUD 头像与小地图）。
 fn team_color(team: Team) -> egui::Color32 {
@@ -537,14 +619,14 @@ fn draw_hero_tags(
 }
 
 // ============================================================
-// 2. 右上角小地图：折叠线 / 单条兵线 / 塔 / 基地 / 金矿 / 实体
+// 2. 右上角小地图：横向长方形 / 纵向河道 / 单条水平兵线 / 塔 / 基地 / 矿坑 / 商店 / 实体
 // ============================================================
 
-/// 世界坐标 (x,z) → 小地图像素坐标。地图范围与 `game_core::map` 保持一致。
-const MINIMAP_HALF: f32 = MAP_WIDTH * 0.5;
+/// 世界坐标 (x,z) → 小地图像素坐标。**分轴归一化**：地图是 2:1 长方形，
+/// 旧版用同一个 `MAP_WIDTH*0.5` 归一化两轴会把 z 方向压扁到上半张图。
 fn to_minimap(x: f32, z: f32, rect: egui::Rect) -> egui::Pos2 {
-    let nx = ((x / MINIMAP_HALF) * 0.5 + 0.5).clamp(0.0, 1.0);
-    let nz = ((z / MINIMAP_HALF) * 0.5 + 0.5).clamp(0.0, 1.0);
+    let nx = ((x / MAP_W_HALF) * 0.5 + 0.5).clamp(0.0, 1.0);
+    let nz = ((z / MAP_H_HALF) * 0.5 + 0.5).clamp(0.0, 1.0);
     egui::pos2(
         rect.left() + nx * rect.width(),
         rect.top() + nz * rect.height(),
@@ -555,6 +637,8 @@ fn draw_minimap(
     mut contexts: EguiContexts,
     received: Res<ReceivedSnapshot>,
     lobby: Res<ClientLobbyInfo>,
+    fog: Option<Res<crate::fog::FogOfWar>>,
+    nav: Option<Res<crate::input::ClientNavObstacles>>,
     mut ran: Local<bool>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -564,28 +648,41 @@ fn draw_minimap(
         info!("[UI] minimap draw system running");
         *ran = true;
     }
-    let size = 190.0;
+    // 小地图与地图同为 2:1 长方形，x/z 缩放完全一致
+    let map_size = egui::vec2(228.0, 114.0);
 
     egui::Area::new("minimap".into())
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 40.0))
         .show(ctx, |ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(map_size, egui::Sense::hover());
             let painter = ui.painter();
 
             // 背景
             painter.rect_filled(rect, 4.0, egui::Color32::from_gray(25));
 
-            // 野区折叠线（3v3 竞技场的镜像对称轴，`z = x` 对角线），与 3D 地图同源
+            // 纵向河道中线（沿 `x = 0` 北 → 南，与北侧水平兵线正交），与 3D 地图同源
             let (fold_a, fold_b) = fold_line_endpoints();
             painter.line_segment(
                 [
                     to_minimap(fold_a.x, fold_a.z, rect),
                     to_minimap(fold_b.x, fold_b.z, rect),
                 ],
-                egui::Stroke::new(1.2, egui::Color32::from_rgb(70, 80, 110)),
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(52, 104, 190)),
             );
+            // 兵线跨河处的桥面：横向短条（河道是纵向的）
+            let bridge = to_minimap(0.0, BRIDGE_Z, rect);
+            painter.line_segment(
+                [
+                    egui::pos2(bridge.x - 7.0, bridge.y),
+                    egui::pos2(bridge.x + 7.0, bridge.y),
+                ],
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(170, 160, 130)),
+            );
+            // 正下方中央：双方共用的野区商店
+            let shop = to_minimap(JUNGLE_SHOP_POS.x, JUNGLE_SHOP_POS.z, rect);
+            painter.circle_filled(shop, 3.5, egui::Color32::from_rgb(148, 96, 214));
 
-            // 金矿 / 海妖坑（地图正中心，金色菱形）
+            // 中央矿坑 / 渊卫坑（兵线中点正下方的河道上，金色菱形）
             let gm = to_minimap(GOLD_MINE_POS.x, GOLD_MINE_POS.z, rect);
             painter.circle_filled(gm, 5.0, egui::Color32::from_rgb(226, 184, 62));
             painter.circle_stroke(
@@ -593,6 +690,20 @@ fn draw_minimap(
                 7.5,
                 egui::Stroke::new(1.5, egui::Color32::from_gray(60)),
             );
+            // 渊卫存活时给出全局目标标记：野怪实体在服务端始终可见（不受视野裁剪），
+            // 因此这里不算泄露信息，且与 `NavObstacleSnapshot.abyss_warden` 同源。
+            if let Some(p) = nav
+                .as_deref()
+                .and_then(|n| n.0.as_ref())
+                .and_then(|s| s.abyss_warden)
+            {
+                let w = to_minimap(p[0], p[1], rect);
+                painter.circle_stroke(
+                    w,
+                    9.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 196, 64)),
+                );
+            }
 
             // 兵线（来自 minion_paths）
             let lane = egui::Stroke::new(1.5, egui::Color32::from_gray(90));
@@ -603,6 +714,16 @@ fn draw_minimap(
                     .map(|w| to_minimap(w.x, w.z, rect))
                     .collect();
                 painter.line(pts, lane);
+            }
+
+            // 兵线 / 野区分隔墙：南侧一道堤墙把兵线与野区分开，断开处即坡道开口。
+            // 与 game_core::map::LANE_WALLS 同源，玩家能在小地图上一眼看出转线路径。
+            let wall = egui::Stroke::new(2.5, egui::Color32::from_rgb(150, 145, 132));
+            for w in LANE_WALLS {
+                painter.line_segment(
+                    [to_minimap(w.x0, w.z, rect), to_minimap(w.x1, w.z, rect)],
+                    wall,
+                );
             }
 
             // 草丛（淡绿圈）
@@ -674,7 +795,50 @@ fn draw_minimap(
                     }
                 }
             }
+
+            // 战争迷雾覆盖层（FR-81）：小地图不显示未探明区域，已探明区域半暗。
+            // 必须画在实体之后，否则视野外的敌方实体会压在暗幕上面穿帮。
+            if let Some(fog) = fog.as_deref().filter(|f| f.enabled) {
+                draw_fog_overlay(painter, rect, fog);
+            }
         });
+}
+
+/// 迷雾覆盖层：按行合并同档位的连续格，避免每帧提交 2048 个矩形。
+fn draw_fog_overlay(painter: &egui::Painter, rect: egui::Rect, fog: &crate::fog::FogOfWar) {
+    use crate::fog::{FOG_CELL_X, FOG_CELL_Z, FOG_NX, FOG_NZ, FogLevel, FogOfWar};
+
+    fn color_of(level: FogLevel) -> Option<egui::Color32> {
+        match level {
+            FogLevel::Visible => None,
+            FogLevel::Explored => Some(egui::Color32::from_rgba_unmultiplied(8, 11, 18, 135)),
+            FogLevel::Unexplored => Some(egui::Color32::from_rgba_unmultiplied(5, 7, 12, 244)),
+        }
+    }
+
+    for iz in 0..FOG_NZ {
+        let mut run_start = 0usize;
+        let mut run_level = fog.level(0, iz);
+        for ix in 1..=FOG_NX {
+            let level = if ix < FOG_NX {
+                fog.level(ix, iz)
+            } else {
+                FogLevel::Visible
+            };
+            if level == run_level && ix < FOG_NX {
+                continue;
+            }
+            if let Some(color) = color_of(run_level) {
+                let c0 = FogOfWar::cell_center(run_start, iz);
+                let c1 = FogOfWar::cell_center(ix - 1, iz);
+                let p0 = to_minimap(c0.x - FOG_CELL_X * 0.5, c0.y - FOG_CELL_Z * 0.5, rect);
+                let p1 = to_minimap(c1.x + FOG_CELL_X * 0.5, c1.y + FOG_CELL_Z * 0.5, rect);
+                painter.rect_filled(egui::Rect::from_min_max(p0, p1), 0.0, color);
+            }
+            run_start = ix;
+            run_level = level;
+        }
+    }
 }
 
 // ============================================================
@@ -764,49 +928,9 @@ fn draw_ability_bar(
 }
 
 // ============================================================
-// 4. 旧商店占位窗口已归档，由 `lobby_ui::draw_shop` 取代（真实 12 件道具 + 购买/售出）
+// 4. 旧商店占位窗口已归档并由 `lobby_ui::draw_shop` 取代（真实 12 件道具 + 购买/售出）。
+//    此处不再保留其占位实现，避免重复 P 键处理与 `ShopOpen` 资源脱节。
 // ============================================================
-#[allow(dead_code)]
-fn draw_shop(mut contexts: EguiContexts, mut open: Local<bool>) {
-    let Ok(ctx) = contexts.ctx_mut() else {
-        return;
-    };
-
-    if ctx.input(|i| i.key_pressed(egui::Key::P)) {
-        *open = !*open;
-    }
-    if !*open {
-        return;
-    }
-
-    egui::Window::new("SHOP (P)")
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new("SHOP (PLACEHOLDER)")
-                    .size(18.0)
-                    .strong(),
-            );
-            ui.separator();
-            ui.label("Buy items with gold. Full catalog: GX-CBT-2026-001 section 10.");
-            ui.separator();
-            egui::Grid::new("shop_grid")
-                .num_columns(4)
-                .spacing([8.0, 8.0])
-                .show(ui, |ui| {
-                    for i in 0..8 {
-                        ui.group(|ui| {
-                            ui.allocate_exact_size(egui::vec2(96.0, 96.0), egui::Sense::click());
-                            ui.label(format!("ITEM {}", i + 1));
-                        });
-                    }
-                });
-            ui.separator();
-            if ui.button("BUY (PLACEHOLDER)").clicked() {
-                info!("[SHOP] placeholder buy clicked");
-            }
-        });
-}
 
 // ============================================================
 // 5. 输入调试面板（左侧中部）
@@ -910,4 +1034,124 @@ fn draw_debug_panel(
             ui.label(format!("FPS: {:.0}", fps));
             ui.label(format!("SNAPSHOT ENTITIES: {}", received.0.entities.len()));
         });
+}
+
+/// 世界空间伤害数字：把飘字锚点投影到屏幕，随目标移动并上浮淡出。
+///
+/// 旧版 `CombatFxRequest.damage` 被 `let _ = req.damage;` 直接丢弃，玩家只能靠血条
+/// 缓慢下降猜有没有打中 —— 这是「普通攻击看不出效果」的另一半原因。
+fn draw_floating_texts(
+    mut contexts: EguiContexts,
+    time: Res<Time>,
+    texts: Option<ResMut<crate::rendering::FloatingTexts>>,
+    units: Query<(&NetId, &GlobalTransform)>,
+    cameras: Query<(&Camera, &GlobalTransform), With<PrimaryEguiContext>>,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    // 资源由 RenderingPlugin 注册；只挂 UiPlugin 的最小夹具里没有也不该 panic。
+    let Some(mut texts) = texts else { return };
+    if texts.0.is_empty() {
+        return;
+    }
+    let Some((camera, cam_gt)) = cameras.iter().next() else {
+        return;
+    };
+    let dt = time.delta_secs();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("floating_damage_numbers"),
+    ));
+    let positions: std::collections::HashMap<u64, Vec3> =
+        units.iter().map(|(n, t)| (n.0, t.translation())).collect();
+    for ft in texts.0.iter_mut() {
+        ft.ttl -= dt;
+        if ft.ttl <= 0.0 {
+            continue;
+        }
+        let Some(&anchor) = positions.get(&ft.anchor.0) else {
+            continue;
+        };
+        let progress = (1.0 - ft.ttl / ft.max_ttl).clamp(0.0, 1.0);
+        let world = anchor + Vec3::Y * (ft.height + progress * 1.35);
+        let Ok(screen) = camera.world_to_viewport(cam_gt, world) else {
+            continue;
+        };
+        let alpha = ((1.0 - progress) * 255.0) as u8;
+        let [r, g, b] = ft.color;
+        painter.text(
+            egui::pos2(screen.x, screen.y),
+            egui::Align2::CENTER_CENTER,
+            ft.text.clone(),
+            egui::FontId::proportional(18.0 + (1.0 - progress) * 4.0),
+            egui::Color32::from_rgba_unmultiplied(r, g, b, alpha),
+        );
+    }
+    texts.0.retain(|t| t.ttl > 0.0);
+}
+
+/// 涉水警示：本地英雄站在危险水域时提示正在掉血，并指明桥面是安全通路。
+/// 判据与服务端 `river_hazard_system` 完全同源（`is_hazardous_river`），不会误报。
+fn draw_hazard_warning(
+    mut contexts: EguiContexts,
+    lang: Res<UiLanguage>,
+    heroes: Query<(&GlobalTransform, &Hero), With<LocalPlayer>>,
+) {
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let Some((gt, hero)) = heroes.iter().next() else {
+        return;
+    };
+    if hero.health <= 0.0 || !is_hazardous_river(gt.translation()) {
+        return;
+    }
+    let dps = RIVER_HAZARD_DAMAGE * 60.0 / RIVER_HAZARD_PERIOD_TICKS as f32;
+    let title = t(
+        &lang,
+        "河水灼烧 · 请走桥面过河",
+        "RIVER BURN · USE THE BRIDGE",
+    );
+    egui::Area::new("hazard_warning".into())
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(format!("{title}  -{dps:.0} HP/s"))
+                    .color(egui::Color32::from_rgb(255, 140, 100))
+                    .strong()
+                    .size(18.0),
+            );
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归护栏：小地图必须按 2:1 长方形**分轴归一化**。
+    /// 旧版用同一个 `MAP_WIDTH*0.5` 归一化两轴，长方形下 z 方向会被压到上半张图，
+    /// 南侧野区、两座兵矿与共用商店全部画不进去。
+    #[test]
+    fn minimap_normalizes_both_axes_for_a_landscape_map() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(228.0, 114.0));
+        let nw = to_minimap(-MAP_W_HALF, -MAP_H_HALF, rect);
+        let se = to_minimap(MAP_W_HALF, MAP_H_HALF, rect);
+        assert!((nw.x - rect.left()).abs() < 1e-3 && (nw.y - rect.top()).abs() < 1e-3);
+        assert!((se.x - rect.right()).abs() < 1e-3 && (se.y - rect.bottom()).abs() < 1e-3);
+
+        let center = to_minimap(0.0, 0.0, rect);
+        assert!((center.x - 114.0).abs() < 1e-3);
+        assert!((center.y - 57.0).abs() < 1e-3);
+        // 两轴缩放必须一致，否则圆形的草丛/矿坑会被画成椭圆或错位
+        assert!((rect.width() / MAP_WIDTH - rect.height() / MAP_HEIGHT).abs() < 1e-6);
+
+        // 两座基地在同一水平线上（兵线在北侧），且互为左右镜像
+        let blue = to_minimap(BLUE_BASE.x, BLUE_BASE.z, rect);
+        let red = to_minimap(RED_BASE.x, RED_BASE.z, rect);
+        assert!((blue.y - red.y).abs() < 1e-3);
+        assert!((blue.x + red.x - 2.0 * center.x).abs() < 1e-3);
+        assert!(blue.y < center.y, "兵线应在北半侧");
+
+        // 共用商店在正下方中央
+        let shop = to_minimap(JUNGLE_SHOP_POS.x, JUNGLE_SHOP_POS.z, rect);
+        assert!((shop.x - center.x).abs() < 1e-3);
+        assert!(shop.y > center.y);
+    }
 }

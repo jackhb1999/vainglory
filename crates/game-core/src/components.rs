@@ -35,6 +35,13 @@ pub enum DamageType {
 /// 英雄基础移速（服务端与客户端预测必须保持一致，否则预测回滚会反复硬修正）
 pub const HERO_BASE_MOVE_SPEED: f32 = 8.0;
 
+/// **基础经济**：英雄出生时的金币。等于商店里最便宜的一件起始小件（300），
+/// 保证开局立刻能买第一件装备，而不是开局 0 金、只能干等被动收入。
+pub const STARTING_GOLD: u32 = 300;
+/// 被动金币速率（金/秒）。与 `gx-proto-content::EconomyDef.passive_gold_per_tick = 0.05`
+/// 在 60Hz 下等价（0.05 × 60 = 3.0）；这里用「每秒」表达，避免按 tick 取整归零。
+pub const PASSIVE_GOLD_PER_SECOND: f32 = 3.0;
+
 /// 英雄角色组件
 #[derive(Component, Clone, Debug, Serialize, Deserialize)]
 pub struct Hero {
@@ -66,7 +73,9 @@ impl Default for Hero {
             skin: 0,
             level: 1,
             experience: 0,
-            gold: 0,
+            // 基础经济：所有英雄（玩家 / PvE 对手 / 客户端镜像）出生即带开局金币，
+            // 无需在每个 spawn 点各写一次，也不会漏掉某条生成路径。
+            gold: STARTING_GOLD,
             max_health: 1000.0,
             health: 1000.0,
             max_energy: 500.0,
@@ -145,6 +154,11 @@ pub struct JungleMonster {
     pub leash_range: f32,
     pub spawn_tick: u64,
     pub last_attacker: Option<NetId>,
+    /// 攻击间隔（tick，60Hz）；0 会被 `monster_attack_system` 兜底为 60。
+    /// 旧版没有冷却：Aggro 状态每 tick 插一次 `AttackCommand` 并当 tick 结算，等于 60 次/秒。
+    pub attack_interval_ticks: u64,
+    /// 下一次可发起攻击的权威 tick（由 `SimTime::tick()` 裁决，不信任客户端时间）。
+    pub next_attack_tick: u64,
 }
 
 /// 技能组件

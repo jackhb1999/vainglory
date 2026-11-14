@@ -160,16 +160,19 @@ fn step_sim(server: &mut App, delta: Duration) {
     server.world_mut().run_schedule(FixedUpdate);
 }
 
+/// 与真实游戏进程共用默认 5000 端口会冲突，改用专用端口。
+const HANDSHAKE_PORT: u16 = 5101;
+
 #[test]
 fn client_connects_and_match_starts() {
-    let mut server = spawn_server_app(5000);
+    let mut server = spawn_server_app(HANDSHAKE_PORT);
     // 首次 update 触发 Startup（start_server），随后 Update 系统开始运行
     step_server(&mut server);
 
     let delta = Duration::from_secs_f64(1.0 / 60.0);
 
-    let mut c1 = connect_client(5000);
-    let mut c2 = connect_client(5000);
+    let mut c1 = connect_client(HANDSHAKE_PORT);
+    let mut c2 = connect_client(HANDSHAKE_PORT);
 
     let mut c1_welcome = false;
     let mut c1_spawn = false;

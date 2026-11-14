@@ -11,9 +11,10 @@ use bevy::image::Image;
 use bevy::prelude::*;
 use game_core::components::Team;
 use game_core::map::{
-    BLUE_SOURCE_CORE, BUSHES, GOLD_MINE_POS, JUNGLE_CAMPS, LANE_COUNT, LANE_WIDTH, MAP_HALF,
-    MAP_HEIGHT, MAP_WIDTH, RED_SOURCE_CORE, RIVER_HALF_WIDTH, TRAINING_DUMMY_POS, TURRET_POSITIONS,
-    fold_line_endpoints, lane_waypoints,
+    BLUE_SOURCE_CORE, BUSHES, GOLD_MINE_POS, JUNGLE_CAMPS, JUNGLE_SHOP_POS, LANE_COUNT, LANE_WALLS,
+    LANE_WIDTH, MAP_H_HALF, MAP_HEIGHT, MAP_W_HALF, MAP_WIDTH, RED_SOURCE_CORE, RIVER_HALF_WIDTH,
+    TRAINING_DUMMY_POS, TURRET_POSITIONS, WALL_HALF_THICKNESS, fold_line_endpoints, is_bridge,
+    is_river, lane_waypoints,
 };
 
 /// 有限调色板（PRES-5）。每类只有底色与点缀色两种。
@@ -102,6 +103,11 @@ pub const LAYER_WAYPOINT: TerrainLayer = TerrainLayer {
 }; // 顶  0.225
 
 /// 有序层表，供生成函数与单测共用（**规范即实现**）。
+/// 地面拼贴按 **2:1 长方形**分轴取块数，每格 10 单位：
+/// 32 列 × 16 行正好铺满 320×160，且「块宽 == 中心距」不产生水平重叠共面。
+pub const GROUND_TILES_X: usize = 32;
+pub const GROUND_TILES_Z: usize = 16;
+
 pub const TERRAIN_LAYERS: [TerrainLayer; 7] = [
     LAYER_RIVER_BED,
     LAYER_WATER,
@@ -760,7 +766,7 @@ fn spawn_voxel_stack(
     parent
 }
 
-/// 在地面铺一条带旋转的路面（用于兵线与折叠线石径）。
+/// 在地面铺一条带旋转的路面（用于水平兵线与纵向河岸石径）。
 fn spawn_ground_strip(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -789,7 +795,7 @@ fn spawn_ground_strip(
     ));
 }
 
-/// 体素地形：棋盘式地面 / 单条兵线 / 折叠线石径 / 野区 / 草丛 / 基地 / 哨塔 / 源核 / 金矿坑。
+/// 体素地形（2:1 横向长方形）：棋盘式地面 / 纵向河道与兵线跨河桥面 / 单条水平兵线 / 南侧野区 / 草丛 / 基地 / 哨塔 / 源核 / 中央矿坑 / 共用野区商店。
 pub fn spawn_voxel_terrain(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -872,17 +878,17 @@ pub fn spawn_voxel_terrain(
     );
     let cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
 
-    // 地面（P-V4）：12×12 拼贴，块宽严格等于中心距（旧版 `tile + 0.2` 造成
+    // 地面（P-V4）：32×16 长方形拼贴，块宽严格等于中心距（旧版 `tile + 0.2` 造成
     // 相邻块水平重叠 0.2 且完全共面，是「随镜头移动闪烁」的主因）。
-    // 河道带 `|x| ≤ RIVER_HALF_WIDTH` 从地面中扣除，改铺下沉河床 + 水面，
-    // 陆地与水面**水平不重叠**，因此不会 z-fighting。
-    let tile = MAP_WIDTH / 12.0;
-    let river = RIVER_HALF_WIDTH;
-    for iz in 0..12usize {
-        let z = -MAP_HALF + tile * (iz as f32 + 0.5);
-        for ix in 0..12usize {
-            let x0 = -MAP_HALF + tile * ix as f32;
-            let x1 = x0 + tile;
+    // 河道是沿中轴 `x = 0` 的**纵向带**（与北侧水平兵线正交），用整块归类铺成体素带：
+    // 河块 = 下沉河床 + 水面，桥块 = 石质桥面，陆块 = 草地/泥土。
+    // 每块只生成其中一种，水平不重叠，因此不会 z-fighting。
+    let tile = MAP_WIDTH / GROUND_TILES_X as f32;
+    for iz in 0..GROUND_TILES_Z {
+        let z = -MAP_H_HALF + tile * (iz as f32 + 0.5);
+        for ix in 0..GROUND_TILES_X {
+            let x = -MAP_W_HALF + tile * (ix as f32 + 0.5);
+            let center = Vec3::new(x, 0.0, z);
             let pick = (ix * 5 + iz * 3) % 13;
             let mat = if pick == 0 {
                 dirt.clone()
@@ -891,31 +897,24 @@ pub fn spawn_voxel_terrain(
             } else {
                 grass.clone()
             };
-            // 区间减法：[x0,x1] 扣去河道带，生成左右两段陆地
-            for (a, b) in [(x0, x1.min(-river)), (x0.max(river), x1)] {
-                if b <= a {
-                    continue;
-                }
+            if is_bridge(center) {
+                // 中央桥面：与兵线同高的石质平台，标识全速通行区
                 commands.spawn((
                     Mesh3d(cube.clone()),
-                    MeshMaterial3d(mat.clone()),
-                    Transform::from_xyz((a + b) * 0.5, LAYER_GROUND.y, z).with_scale(Vec3::new(
-                        b - a,
-                        LAYER_GROUND.thickness,
+                    MeshMaterial3d(stone.clone()),
+                    Transform::from_xyz(x, LAYER_FOLD.y, z).with_scale(Vec3::new(
+                        tile,
+                        LAYER_FOLD.thickness,
                         tile,
                     )),
                 ));
-            }
-            // 河道段：河床（压暗土层）+ 水面，均低于地面顶面，形成可涉水下沉带
-            let a = x0.max(-river);
-            let b = x1.min(river);
-            if b > a {
-                let cx = (a + b) * 0.5;
+            } else if is_river(center) {
+                // 河道：河床 + 水面，均低于地面顶面，形成可涉水下沉带
                 commands.spawn((
                     Mesh3d(cube.clone()),
                     MeshMaterial3d(dirt.clone()),
-                    Transform::from_xyz(cx, LAYER_RIVER_BED.y, z).with_scale(Vec3::new(
-                        b - a,
+                    Transform::from_xyz(x, LAYER_RIVER_BED.y, z).with_scale(Vec3::new(
+                        tile,
                         LAYER_RIVER_BED.thickness,
                         tile,
                     )),
@@ -923,34 +922,50 @@ pub fn spawn_voxel_terrain(
                 commands.spawn((
                     Mesh3d(cube.clone()),
                     MeshMaterial3d(water.clone()),
-                    Transform::from_xyz(cx, LAYER_WATER.y, z).with_scale(Vec3::new(
-                        b - a,
+                    Transform::from_xyz(x, LAYER_WATER.y, z).with_scale(Vec3::new(
+                        tile,
                         LAYER_WATER.thickness,
+                        tile,
+                    )),
+                ));
+            } else {
+                commands.spawn((
+                    Mesh3d(cube.clone()),
+                    MeshMaterial3d(mat),
+                    Transform::from_xyz(x, LAYER_GROUND.y, z).with_scale(Vec3::new(
+                        tile,
+                        LAYER_GROUND.thickness,
                         tile,
                     )),
                 ));
             }
         }
-        // 河岸：两侧窄石条，明确高度层边界（与地面 y 差 ≥0.15，不共面）
-        for side in [-1.0_f32, 1.0] {
-            commands.spawn((
-                Mesh3d(cube.clone()),
-                MeshMaterial3d(stone.clone()),
-                Transform::from_xyz(side * (river + 0.6), LAYER_BANK.y, z).with_scale(Vec3::new(
-                    1.2,
-                    LAYER_BANK.thickness,
-                    tile,
-                )),
-            ));
-        }
     }
 
-    // 地图边界：低矮石墙，明确可活动范围
+    // 河岸：沿纵向河道两侧各一条窄石带（x = ±(半宽+0.6)），
+    // 位于独立高度层（与地面顶面差 ≥0.05，不共面）。
+    let (fold_a, fold_b) = fold_line_endpoints();
+    for side in [-1.0_f32, 1.0] {
+        let off = Vec3::new(side * (RIVER_HALF_WIDTH + 0.6), 0.0, 0.0);
+        spawn_ground_strip(
+            commands,
+            meshes,
+            materials,
+            images,
+            PixelKind::Stone,
+            fold_a + off,
+            fold_b + off,
+            1.2,
+            LAYER_BANK.y,
+        );
+    }
+
+    // 地图边界：低矮石墙，明确可活动范围（长方形分轴取半径）
     for (x, z, sx, sz) in [
-        (0.0, -MAP_HALF, MAP_WIDTH + 1.0, 1.0),
-        (0.0, MAP_HALF, MAP_WIDTH + 1.0, 1.0),
-        (-MAP_HALF, 0.0, 1.0, MAP_HEIGHT + 1.0),
-        (MAP_HALF, 0.0, 1.0, MAP_HEIGHT + 1.0),
+        (0.0, -MAP_H_HALF, MAP_WIDTH + 1.0, 1.0),
+        (0.0, MAP_H_HALF, MAP_WIDTH + 1.0, 1.0),
+        (-MAP_W_HALF, 0.0, 1.0, MAP_HEIGHT + 1.0),
+        (MAP_W_HALF, 0.0, 1.0, MAP_HEIGHT + 1.0),
     ] {
         commands.spawn((
             Mesh3d(cube.clone()),
@@ -959,22 +974,48 @@ pub fn spawn_voxel_terrain(
         ));
     }
 
-    // 折叠线（3v3 竞技场的镜像对称轴，`z = x` 对角线）：
-    // 用一条浅色石径表示“地图折痕”，同时把两片野区分开（该地图没有河道）。
-    let (fold_a, fold_b) = fold_line_endpoints();
-    spawn_ground_strip(
-        commands,
-        meshes,
-        materials,
-        images,
-        PixelKind::Stone,
-        fold_a,
-        fold_b,
-        3.0,
-        LAYER_FOLD.y,
-    );
+    // 兵线 / 野区分隔墙：**只在兵线南侧（靠野区一侧）**有一道堤墙，
+    // 在对称坡道开口处断开；兵线北侧靠地图边界，不设墙。
+    // 与 `game_core::map::LANE_WALLS` / `wall_colliders()` 同源 —— 服务端静态碰撞、
+    // 客户端预测、A* 障碍格、小地图都读这一份，这里只负责把它画出来。
+    // 段端立柱同时标出坡道入口，玩家能一眼看出从哪里可以转进野区。
+    const WALL_HEIGHT: f32 = 2.6;
+    for w in LANE_WALLS {
+        let len = w.x1 - w.x0;
+        let mid = (w.x0 + w.x1) * 0.5;
+        commands.spawn((
+            Mesh3d(cube.clone()),
+            MeshMaterial3d(stone.clone()),
+            Transform::from_xyz(mid, WALL_HEIGHT * 0.5, w.z).with_scale(Vec3::new(
+                len,
+                WALL_HEIGHT,
+                WALL_HALF_THICKNESS * 2.0,
+            )),
+        ));
+        // 压顶石：位于主体顶面之上，独立高度层，不与主体共面
+        commands.spawn((
+            Mesh3d(cube.clone()),
+            MeshMaterial3d(lane_mat.clone()),
+            Transform::from_xyz(mid, WALL_HEIGHT + 0.16, w.z).with_scale(Vec3::new(
+                len,
+                0.32,
+                WALL_HALF_THICKNESS * 2.0 + 0.5,
+            )),
+        ));
+        for x in [w.x0, w.x1] {
+            commands.spawn((
+                Mesh3d(cube.clone()),
+                MeshMaterial3d(stone.clone()),
+                Transform::from_xyz(x, WALL_HEIGHT * 0.75, w.z).with_scale(Vec3::new(
+                    WALL_HALF_THICKNESS * 2.4,
+                    WALL_HEIGHT * 1.5,
+                    WALL_HALF_THICKNESS * 2.4,
+                )),
+            ));
+        }
+    }
 
-    // 金矿 / 海妖坑（地图正中心）：石质圆台 + 金色矿石，后期由海妖占据
+    // 中央矿坑 / 海兽坑：位于**兵线中点正下方**的河道之上（石台盖住水面），后期由海兽占据
     commands.spawn((
         Mesh3d(meshes.add(Cuboid::new(14.0, 0.3, 14.0))),
         MeshMaterial3d(stone.clone()),
@@ -987,6 +1028,30 @@ pub fn spawn_voxel_terrain(
             Transform::from_xyz(GOLD_MINE_POS.x + dx, 1.2, GOLD_MINE_POS.z + dz)
                 .with_scale(Vec3::new(1.8, 2.4, 1.8)),
         ));
+    }
+
+    // 野区商店：地图正下方中央、双方共用。石质广场跨在河道南端之上，
+    // 四角立柱 + 中央青色柜台，对应营地点 `MusterWell`。
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::new(20.0, 0.3, 16.0))),
+        MeshMaterial3d(stone.clone()),
+        Transform::from_xyz(JUNGLE_SHOP_POS.x, 0.02, JUNGLE_SHOP_POS.z),
+    ));
+    commands.spawn((
+        Mesh3d(cube.clone()),
+        MeshMaterial3d(voxel_material(materials, images, PixelKind::Core, 53, true)),
+        Transform::from_xyz(JUNGLE_SHOP_POS.x, 1.0, JUNGLE_SHOP_POS.z)
+            .with_scale(Vec3::new(3.0, 2.0, 3.0)),
+    ));
+    for dx in [-8.0_f32, 8.0] {
+        for dz in [-6.0_f32, 6.0] {
+            commands.spawn((
+                Mesh3d(cube.clone()),
+                MeshMaterial3d(stone.clone()),
+                Transform::from_xyz(JUNGLE_SHOP_POS.x + dx, 1.4, JUNGLE_SHOP_POS.z + dz)
+                    .with_scale(Vec3::new(1.2, 2.8, 1.2)),
+            ));
+        }
     }
 
     // 唯一兵线（3v3 竞技场）：与 `game_core::map` 的路点完全同源，分段铺成连续路面
@@ -1149,6 +1214,7 @@ pub fn make_hero_texture(images: &mut Assets<Image>, color: Color) -> Handle<Ima
 #[cfg(test)]
 mod terrain_tests {
     use super::*;
+    use game_core::map::{BRIDGE_Z, LANE_Z};
 
     /// 回归护栏：地形分层必须严格递增且相邻顶面间隔 ≥ 0.05，
     /// 否则随相机平移会重新出现共面 z-fighting（本次闪烁 bug 的结构性根因）。
@@ -1168,13 +1234,58 @@ mod terrain_tests {
         assert!(LAYER_WATER.top() < LAYER_GROUND.top(), "水面必须低于地面");
     }
 
-    /// 地面拼贴块宽必须严格等于中心距（旧版 `tile + 0.2` 造成水平重叠共面）。
+    /// 地面拼贴块宽必须严格等于中心距（旧版 `tile + 0.2` 造成水平重叠共面），
+    /// 且长方形下分轴块数分别铺满 MAP_WIDTH / MAP_HEIGHT。
     #[test]
     fn ground_tiles_do_not_overlap() {
-        let tile = MAP_WIDTH / 12.0;
-        assert_eq!(tile, 20.0);
+        let tile = MAP_WIDTH / GROUND_TILES_X as f32;
+        // 地图整体等比放大后，拼贴块数不变、块边长随 MAP_SCALE 一起变。
+        assert_eq!(tile, 10.0 * game_core::map::MAP_SCALE);
+        assert_eq!(tile * GROUND_TILES_Z as f32, MAP_HEIGHT);
+        assert_eq!(tile * GROUND_TILES_X as f32, MAP_WIDTH);
         assert!(RIVER_HALF_WIDTH > 0.0 && RIVER_HALF_WIDTH < tile);
         assert!((LAYER_GROUND.top() + 0.05).abs() < 1e-5);
+    }
+
+    /// 渲染用的墙段与服务端碰撞 / A* 障碍必须是同一份数据，且只存在于兵线南侧。
+    #[test]
+    fn lane_walls_are_rendered_from_the_authoritative_segments() {
+        assert_eq!(LANE_WALLS.len(), 4);
+        let south = game_core::map::WALL_SOUTH_Z;
+        assert!(south > LANE_Z);
+        assert_eq!(LANE_WALLS.iter().filter(|w| w.z == south).count(), 4);
+        assert!(
+            LANE_WALLS.iter().all(|w| w.z > LANE_Z),
+            "兵线北侧（靠地图边界）不得渲染墙体"
+        );
+        // 渲染用的墙厚必须与服务端 / 客户端预测的碰撞圆半径完全同源
+        assert!(
+            game_core::map::wall_colliders()
+                .iter()
+                .all(|(_, r)| *r == WALL_HALF_THICKNESS)
+        );
+        // 坡道开口处不能渲染出墙段
+        for w in LANE_WALLS {
+            assert!(!game_core::map::is_lane_wall_gap((w.x0 + w.x1) * 0.5));
+        }
+    }
+
+    /// 经典 3v3 回归护栏：河道是沿 `x = 0` 的**纵向**带，与北侧水平兵线正交，
+    /// 且渲染层与裁决层用同一套几何（不出现「看到的河」和「减速的河」不一致）。
+    #[test]
+    fn river_is_longitudinal_and_orthogonal_to_lane() {
+        assert!(is_river(Vec3::new(0.0, 0.0, 40.0)));
+        assert!(is_river(Vec3::new(4.0, 0.0, -70.0)));
+        assert!(is_bridge(Vec3::new(0.0, 0.0, LANE_Z)));
+        // 左右野区（河道两侧）都是陆地
+        assert!(!is_river(Vec3::new(40.0, 0.0, 0.0)));
+        assert!(!is_river(Vec3::new(-40.0, 0.0, 0.0)));
+        // 折叠线是沿 z 的中轴，两端 x 恒为 0
+        let (a, b) = fold_line_endpoints();
+        assert_eq!(a.x, 0.0);
+        assert_eq!(b.x, 0.0);
+        assert!(a.z < LANE_Z && b.z > LANE_Z);
+        assert_eq!(BRIDGE_Z, LANE_Z, "桥面必须在兵线跨河处");
     }
 
     /// P-V4：`PixelKind::Water` 已从「定义未启用」变为真实可用。

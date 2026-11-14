@@ -1,11 +1,12 @@
-//! 端到端移动链路测试：方向键 / WASD → handle_input → PlayerInputState →
+//! 端到端移动链路测试：点击目标 → handle_input → PlayerInputState →
 //! 客户端预测 → 上行 InputCmd → 服务端权威模拟 → 快照回传，验证 x/z 两轴都能移动。
+//! v1.3 起为纯点击控制，键盘移动已移除（另有护栏断言）。
 //!
 //! 运行方式：cargo test -p gx-e2e --test e2e_movement -- --nocapture
 
 use bevy::prelude::*;
 use client::{
-    input::{InputPlugin, PlayerInputState},
+    input::{InputPlugin, MoveTarget, PathState, PlayerInputState},
     networking::NetworkingPlugin,
     prediction::PredictionPlugin,
     rendering::RenderingPlugin,
@@ -125,7 +126,8 @@ fn move_dir(client: &App) -> Vec2 {
     client.world().resource::<PlayerInputState>().move_dir
 }
 
-/// 按下方向键 / WASD（headless 手工维护 ButtonInput<KeyCode>）。
+/// 按下某键（headless 手工维护 ButtonInput<KeyCode>）。
+/// v1.3 起仅用于验证「键盘不再驱动移动」。
 fn press_key(client: &mut App, key: KeyCode) {
     let mut kb = ButtonInput::<KeyCode>::default();
     kb.press(key);
@@ -134,6 +136,15 @@ fn press_key(client: &mut App, key: KeyCode) {
 
 fn release_keys(client: &mut App) {
     client.insert_resource(ButtonInput::<KeyCode>::default());
+}
+
+/// 注入一次点击移动的最终产物（`MoveTarget`）。
+/// headless 夹具没有 `Window` / `Camera3d`，无法真实投射鼠标射线，
+/// 因此从点击链路的产物层驱动端到端验证；点击 → MoveTarget 的映射由
+/// `client/src/input.rs` 单测覆盖。
+fn set_click_target(client: &mut App, goal: Vec2) {
+    client.insert_resource(MoveTarget(Some(goal)));
+    client.insert_resource(PathState::default());
 }
 
 /// 按住某键若干帧，返回 (dx, dz)
@@ -148,7 +159,7 @@ fn run_frames(client: &mut App, server: &mut App, n: usize) -> (f32, f32) {
 }
 
 #[test]
-fn arrow_keys_move_hero_in_z() {
+fn click_target_moves_hero_in_z() {
     let port = 5300;
     let mut server = spawn_server_app(port);
     let mut client = spawn_client_app();
@@ -157,40 +168,75 @@ fn arrow_keys_move_hero_in_z() {
 
     let start = local_hero_pos(&mut client);
     eprintln!("hero start pos={:?}", start);
-
-    press_key(&mut client, KeyCode::ArrowUp);
+    set_click_target(&mut client, Vec2::new(start.x, start.z + 40.0));
     step_fixed(&mut server);
     step_fixed(&mut client);
     let dir = move_dir(&client);
-    eprintln!("move_dir after ArrowUp = {:?}", dir);
+    eprintln!("move_dir after +Z click = {:?}", dir);
     assert!(
-        dir.y < -0.5,
-        "ArrowUp should produce -y move_dir, got {dir:?}"
+        dir.y > 0.5,
+        "+Z click should produce +y move_dir, got {dir:?}"
     );
 
     let (dx, dz) = run_frames(&mut client, &mut server, 60);
-    eprintln!("after 60 frames of ArrowUp: dx={} dz={}", dx, dz);
-    assert!(dz < -1.0, "hero should move -Z: dz={}", dz);
+    eprintln!("after 60 frames of +Z click: dx={} dz={}", dx, dz);
+    assert!(dz > 1.0, "hero should move +Z: dz={}", dz);
+    assert!(
+        dx.abs() < 1.0,
+        "pure Z target must not drift in X: dx={}",
+        dx
+    );
 
-    press_key(&mut client, KeyCode::ArrowDown);
-    let (dx2, dz2) = run_frames(&mut client, &mut server, 60);
-    eprintln!("after 60 frames of ArrowDown: dx={} dz={}", dx2, dz2);
-    assert!(dz2 > 1.0, "hero should move +Z: dz={}", dz2);
-    release_keys(&mut client);
+    let now = local_hero_pos(&mut client);
+    set_click_target(&mut client, Vec2::new(now.x, now.z - 40.0));
+    let (_, dz2) = run_frames(&mut client, &mut server, 60);
+    eprintln!("after 60 frames of -Z click: dz={}", dz2);
+    assert!(dz2 < -1.0, "hero should move -Z: dz={}", dz2);
 }
 
 #[test]
-fn wasd_moves_hero_in_x() {
+fn click_target_moves_hero_in_x() {
     let port = 5301;
     let mut server = spawn_server_app(port);
     let mut client = spawn_client_app();
     rehook_client_to_port(&mut client, port);
     handshake(&mut server, &mut client);
 
-    press_key(&mut client, KeyCode::KeyD);
+    let start = local_hero_pos(&mut client);
+    set_click_target(&mut client, Vec2::new(start.x + 40.0, start.z));
     let (dx, dz) = run_frames(&mut client, &mut server, 60);
-    eprintln!("after 60 frames of D: dx={} dz={}", dx, dz);
+    eprintln!("after 60 frames of +X click: dx={} dz={}", dx, dz);
     assert!(dx > 1.0, "hero should move +X: dx={}", dx);
+    assert!(
+        dz.abs() < 1.0,
+        "pure X target must not drift in Z: dz={}",
+        dz
+    );
+}
+
+/// v1.3 回归护栏：键盘 W/A/S/D 与方向键不得再驱动英雄移动。
+#[test]
+fn keyboard_no_longer_moves_hero() {
+    let port = 5303;
+    let mut server = spawn_server_app(port);
+    let mut client = spawn_client_app();
+    rehook_client_to_port(&mut client, port);
+    handshake(&mut server, &mut client);
+
+    press_key(&mut client, KeyCode::ArrowUp);
+    step_fixed(&mut server);
+    step_fixed(&mut client);
+    assert_eq!(
+        move_dir(&client),
+        Vec2::ZERO,
+        "ArrowUp must not produce move_dir in click-only control"
+    );
+    let (dx, dz) = run_frames(&mut client, &mut server, 60);
+    eprintln!("after 60 frames of ArrowUp: dx={} dz={}", dx, dz);
+    assert!(
+        dx.abs() < 1.0 && dz.abs() < 1.0,
+        "keyboard must not move the hero: dx={dx} dz={dz}"
+    );
     release_keys(&mut client);
 }
 

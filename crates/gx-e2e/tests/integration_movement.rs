@@ -17,7 +17,16 @@ use server::simulation::SimulationPlugin as ServerSim;
 use server::spawn::SpawnPlugin as ServerSpawn;
 use std::time::Duration;
 
+/// 该测试与真实游戏进程共用默认 5000 端口会冲突，改用专用端口；
+/// 客户端 `server_address()` 读取 `GX_SERVER_PORT`，因此两端都指向同一端口。
+const TEST_PORT: u16 = 5099;
+
 fn main_app() -> (App, App) {
+    // SAFETY: 该测试二进制只有一个测试、单线程运行，且在此之后不再读写环境变量；
+    // 其他测试各自是独立进程，不会被这里的修改影响。
+    unsafe {
+        std::env::set_var("GX_SERVER_PORT", TEST_PORT.to_string());
+    }
     let mut server = App::new();
     server
         .add_plugins(MinimalPlugins)
@@ -28,7 +37,7 @@ fn main_app() -> (App, App) {
         .add_plugins(ServerSpawn)
         .init_resource::<Assets<Mesh>>()
         .init_resource::<Assets<StandardMaterial>>()
-        .insert_resource(ServerPort(5000))
+        .insert_resource(ServerPort(TEST_PORT))
         .insert_resource(Time::<Fixed>::from_hz(60.0));
 
     let mut client = App::new();

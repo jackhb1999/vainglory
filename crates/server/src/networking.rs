@@ -19,7 +19,7 @@ use game_core::net::{
     SNAPSHOT_INTERVAL_TICKS, ServerMessage, SessionToken, Snapshot, SnapshotHeader, Vec3f,
     WorldSnapshot, negotiate,
 };
-use game_core::visibility::{compute_visibility, event_visible};
+use game_core::visibility::{compute_visibility, event_visible, vision_sources};
 use gx_config::ConfigSet;
 use gx_net::VisibilityPolicy;
 use renet2::{ClientId, ConnectionConfig, DefaultChannel, RenetServer};
@@ -182,6 +182,8 @@ impl Plugin for NetworkingPlugin {
                     receive_inputs,
                     handle_gameplay_messages,
                     broadcast_snapshot,
+                    // 全局动态障碍视图必须在同一 Update 里跟在快照之后下发
+                    broadcast_nav_grid,
                 )
                     .chain(),
             );
@@ -669,7 +671,18 @@ fn collect_entities(
     )>,
     projectiles: &Query<(&NetId, &Team, &TransformSync, &Projectile)>,
     turrets: &Query<(&NetId, &Team, &TransformSync, &Turret)>,
-    minions: &Query<(&NetId, &Team, &TransformSync, &Minion)>,
+    // 兵线与野怪共用一条可选查询，避免再给 broadcast_snapshot 增加一个系统参数。
+    // 野怪此前完全没进快照，客户端 `sync_monsters` 永远收不到实体 → 看不到、点不中、打不了。
+    #[allow(clippy::type_complexity)] minions: &Query<
+        (
+            &NetId,
+            &Team,
+            &TransformSync,
+            Option<&Minion>,
+            Option<&JungleMonster>,
+        ),
+        Or<(With<Minion>, With<JungleMonster>)>,
+    >,
 ) -> Vec<EntitySnapshot> {
     let mut entities: Vec<EntitySnapshot> = heroes
         .iter()
@@ -714,16 +727,22 @@ fn collect_entities(
         });
     }
 
-    for (net_id, team, ts, minion) in minions.iter() {
+    for (net_id, team, ts, minion, monster) in minions.iter() {
+        let Some((health, max_health, entity_type)) = minion
+            .map(|m| (m.health, m.max_health, EntityType::Minion))
+            .or_else(|| monster.map(|m| (m.health, m.max_health, EntityType::JungleMonster)))
+        else {
+            continue;
+        };
         entities.push(EntitySnapshot {
             net_id: *net_id,
-            entity_type: EntityType::Minion,
+            entity_type,
             team: *team,
             position: Vec3f::from_vec3(ts.position),
             rotation: Quatf::default(),
             velocity: Vec3f::zero(),
-            health: minion.health,
-            max_health: minion.max_health,
+            health,
+            max_health,
             energy: 0.0,
             max_energy: 0.0,
             level: 0,
@@ -756,6 +775,43 @@ fn collect_entities(
     entities
 }
 
+/// `NAV-M2-01-C8`：把权威**全局**动态障碍视图 + 网格版本下发给所有客户端。
+///
+/// - 变化立即发；无变化每 30 tick 补发一次（覆盖新加入 / 断线重连的客户端）；
+/// - 走 ReliableOrdered 且**不经逐玩家视野裁剪**：视野外的哨塔同样必须进 A* walls，
+///   否则客户端只能从（被裁剪过的）渲染实体推断障碍，正是 C1 禁止的做法；
+/// - 版本由服务端唯一裁决，客户端不上报任何网格数据。
+#[allow(clippy::too_many_arguments)]
+fn broadcast_nav_grid(
+    nav: Option<Res<game_core::navgrid::NavGrid>>,
+    server_res: Option<ResMut<RenetServerResource>>,
+    tick: Option<Res<crate::simulation::ServerTick>>,
+    clients: Option<Res<ClientNetIds>>,
+    mut last_version: Local<u32>,
+) {
+    let (Some(nav), Some(mut server), Some(tick), Some(clients)) = (nav, server_res, tick, clients)
+    else {
+        return;
+    };
+    let due = tick
+        .0
+        .is_multiple_of(game_core::navgrid::NAV_REBUILD_INTERVAL_TICKS);
+    if nav.version == *last_version && !due {
+        return;
+    }
+    *last_version = nav.version;
+    let msg = ServerMessage::NavGridUpdate {
+        snapshot: nav.obstacle_snapshot(tick.0),
+        version: nav.version,
+    };
+    let bytes = bitcode::encode(&msg);
+    for client_id in clients.0.keys() {
+        server
+            .0
+            .send_message(*client_id, DefaultChannel::ReliableOrdered, bytes.clone());
+    }
+}
+
 /// 视野裁剪 + 增量编码 + 通道分级；状态走 Unreliable，关键事件走 ReliableOrdered 且幂等。
 #[allow(clippy::too_many_arguments)]
 fn broadcast_snapshot(
@@ -772,7 +828,16 @@ fn broadcast_snapshot(
     )>,
     projectiles: Query<(&NetId, &Team, &TransformSync, &Projectile)>,
     turrets: Query<(&NetId, &Team, &TransformSync, &Turret)>,
-    minions: Query<(&NetId, &Team, &TransformSync, &Minion)>,
+    #[allow(clippy::type_complexity)] minions: Query<
+        (
+            &NetId,
+            &Team,
+            &TransformSync,
+            Option<&Minion>,
+            Option<&JungleMonster>,
+        ),
+        Or<(With<Minion>, With<JungleMonster>)>,
+    >,
     mut server_events: ResMut<ServerEvents>,
     tick: Res<crate::simulation::ServerTick>,
     config: Res<ServerConfig>,
@@ -823,7 +888,7 @@ fn broadcast_snapshot(
 
     // 状态快照：20Hz 增量；每 2s 或首次/重连补基线
     if tick.0.is_multiple_of(SNAPSHOT_INTERVAL_TICKS) || !events.is_empty() {
-        for (client_id, net_id, _team, set) in &per_client {
+        for (client_id, net_id, team, set) in &per_client {
             let visible_entities: Vec<EntitySnapshot> = entities
                 .iter()
                 .filter(|e| set.contains(e.net_id.0))
@@ -889,6 +954,26 @@ fn broadcast_snapshot(
                 DefaultChannel::Unreliable,
                 bitcode::encode(&ServerMessage::Snapshot(snapshot)),
             );
+
+            // 战争迷雾：把**该玩家**的可见源与有效半径一起下发。
+            // 与上面的实体裁剪共用 `vision_sources` / `policy`，遮罩不会和可见集打架；
+            // 只在 20Hz 快照 tick 发送，事件触发的额外快照不重复发。
+            if tick.0.is_multiple_of(SNAPSHOT_INTERVAL_TICKS) {
+                let sources: Vec<[f32; 2]> = vision_sources(*team, &policy, &entities)
+                    .into_iter()
+                    .map(|p| [p[0], p[2]])
+                    .collect();
+                server.0.send_message(
+                    *client_id,
+                    DefaultChannel::Unreliable,
+                    bitcode::encode(&ServerMessage::VisionUpdate {
+                        sources,
+                        vision_radius: policy.vision_radius,
+                        brush_reveal_radius: policy.brush_reveal_radius,
+                        server_tick: tick.0,
+                    }),
+                );
+            }
         }
     }
 
